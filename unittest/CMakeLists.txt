@@ -47,6 +47,10 @@ if (${MD_ENABLE_VLX})
     set (SRC_FILES ${SRC_FILES} test_vlx.c test_gto.c)
 endif()
 
+if (${MD_ENABLE_MOLDEN})
+    set (SRC_FILES ${SRC_FILES} test_molden.c)
+endif()
+
 target_sources(md_unittest PRIVATE ${SRC_FILES})
 
 target_include_directories(md_unittest
