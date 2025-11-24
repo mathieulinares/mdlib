@@ -159,18 +159,14 @@ static molden_section_t parse_section_header(str_t line) {
 }
 
 // Parse [Atoms] section
-static bool parse_atoms_section(md_molden_t* molden, str_t* content) {
+// Note: content pointer is positioned right after the [Atoms] header line
+static bool parse_atoms_section(md_molden_t* molden, str_t* content, bool units_angs) {
     // First pass: count atoms
     str_t temp = *content;
     size_t atom_count = 0;
     
-    str_t line = extract_line(&temp);
-    bool units_angs = str_eq_n_ignore_case(line, STR_LIT("Angs"), 4) || 
-                      str_eq_n_ignore_case(line, STR_LIT("(Angs)"), 6);
-    molden->flags.units_angs = units_angs;
-    
     while (temp.len > 0) {
-        line = extract_line(&temp);
+        str_t line = extract_line(&temp);
         line = skip_whitespace(line);
         if (line.len == 0) continue;
         if (line.ptr[0] == '[') break; // Next section
@@ -190,10 +186,8 @@ static bool parse_atoms_section(md_molden_t* molden, str_t* content) {
     }
     
     // Second pass: parse atom data
-    extract_line(content); // Skip header line
-    
     for (size_t i = 0; i < atom_count; i++) {
-        line = extract_line(content);
+        str_t line = extract_line(content);
         
         char element[4] = {0};
         int dummy_idx, atomic_num;
@@ -290,10 +284,18 @@ static bool molden_parse_str(md_molden_t* molden, str_t content) {
         if (section != MOLDEN_SECTION_NONE) {
             current_section = section;
             
+            // Check for units in [Atoms] section
+            bool units_angs = false;
+            if (section == MOLDEN_SECTION_ATOMS) {
+                units_angs = str_eq_n_ignore_case(line, STR_LIT("[Atoms] Angs"), 12) ||
+                             str_eq_n_ignore_case(line, STR_LIT("[Atoms] (Angs)"), 14);
+                molden->flags.units_angs = units_angs;
+            }
+            
             // Parse sections
             switch (current_section) {
                 case MOLDEN_SECTION_ATOMS:
-                    if (!parse_atoms_section(molden, &content)) {
+                    if (!parse_atoms_section(molden, &content, units_angs)) {
                         MD_LOG_ERROR("Failed to parse [Atoms] section");
                         return false;
                     }
@@ -360,8 +362,7 @@ void md_molden_reset(struct md_molden_t* molden) {
     if (molden->orbitals.mo_coefficients) md_free(molden->alloc, molden->orbitals.mo_coefficients, molden->orbitals.num_mos * molden->orbitals.num_aos * sizeof(double));
     if (molden->orbitals.ao_to_atom) md_free(molden->alloc, molden->orbitals.ao_to_atom, molden->orbitals.num_aos * sizeof(int));
     
-    // Reset structure
-    memset(molden, 0, sizeof(md_molden_t));
+    // Reset structure (preserve allocator)
     struct md_allocator_i* saved_alloc = molden->alloc;
     memset(molden, 0, sizeof(md_molden_t));
     molden->alloc = saved_alloc;
@@ -544,10 +545,17 @@ bool md_molden_system_init(struct md_system_t* sys, const md_molden_t* molden, s
     memset(sys, 0, sizeof(md_system_t));
     
     sys->atom.count = molden->atoms.count;
-    sys->atom.x = md_alloc(alloc, sizeof(float) * molden->atoms.count);
-    sys->atom.y = md_alloc(alloc, sizeof(float) * molden->atoms.count);
-    sys->atom.z = md_alloc(alloc, sizeof(float) * molden->atoms.count);
-    sys->atom.type_idx = md_alloc(alloc, sizeof(md_atom_type_idx_t) * molden->atoms.count);
+    
+    // Allocate using md_array for compatibility with md_system_free
+    sys->atom.x = 0;
+    sys->atom.y = 0;
+    sys->atom.z = 0;
+    sys->atom.type_idx = 0;
+    
+    md_array_resize(sys->atom.x, molden->atoms.count, alloc);
+    md_array_resize(sys->atom.y, molden->atoms.count, alloc);
+    md_array_resize(sys->atom.z, molden->atoms.count, alloc);
+    md_array_resize(sys->atom.type_idx, molden->atoms.count, alloc);
     
     if (!sys->atom.x || !sys->atom.y || !sys->atom.z || !sys->atom.type_idx) {
         MD_LOG_ERROR("Failed to allocate memory for molecule system");
@@ -556,7 +564,8 @@ bool md_molden_system_init(struct md_system_t* sys, const md_molden_t* molden, s
     
     // Setup atom types
     sys->atom.type.count = molden->atoms.count;
-    sys->atom.type.z = md_alloc(alloc, sizeof(md_atomic_number_t) * molden->atoms.count);
+    sys->atom.type.z = 0;
+    md_array_resize(sys->atom.type.z, molden->atoms.count, alloc);
     
     if (!sys->atom.type.z) {
         MD_LOG_ERROR("Failed to allocate memory for atom types");
