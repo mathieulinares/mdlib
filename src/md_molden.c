@@ -1,4 +1,4 @@
-﻿#include <md_molden.h>
+#include <md_molden.h>
 
 #include <core/md_os.h>
 #include <core/md_log.h>
