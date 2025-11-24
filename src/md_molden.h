@@ -108,7 +108,7 @@ str_t md_molden_basis_set_ident(const struct md_molden_t* molden);
 const dvec3_t* md_molden_atom_coordinates(const struct md_molden_t* molden);
 
 // Get atomic numbers (array of length number_of_atoms)
-const uint8_t* md_molden_atomic_numbers(const struct md_molden_t* molden);
+const md_element_t* md_molden_atomic_numbers(const struct md_molden_t* molden);
 
 // Maps AO index to atom index, length is number of atomic orbitals
 const int* md_molden_ao_to_atom_idx(const struct md_molden_t* molden);

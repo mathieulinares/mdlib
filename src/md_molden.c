@@ -159,7 +159,7 @@ md_molden_t* md_molden_create(md_allocator_i* backing) {
 	md_molden_t* molden = md_alloc(arena, sizeof(md_molden_t));
 	if (!molden) {
 		MD_LOG_ERROR("Failed to allocate memory for Molden object");
-		return molden;
+		return NULL;
 	}
 	MEMSET(molden, 0, sizeof(md_molden_t));
 	molden->arena = arena;
@@ -243,7 +243,7 @@ const dvec3_t* md_molden_atom_coordinates(const md_molden_t* molden) {
 	return NULL;
 }
 
-const uint8_t* md_molden_atomic_numbers(const md_molden_t* molden) {
+const md_element_t* md_molden_atomic_numbers(const md_molden_t* molden) {
 	if (molden) return molden->atomic_numbers;
 	return NULL;
 }
