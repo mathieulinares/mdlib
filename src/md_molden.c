@@ -977,32 +977,25 @@ static bool parse_atoms_block(md_molden_t* molden, md_buffered_reader_t* reader)
 	md_allocator_i* alloc = molden->arena;
 	str_t line;
 
-	// Parse coordinate unit from header line
-	// Example: "[Atoms] Angs" or "[Atoms] AU"
-	if (!md_buffered_reader_peek_line(&line, reader)) {
-		MD_LOG_ERROR("Failed to read [Atoms] header");
-		return false;
-	}
-	
-	if (str_find_str(NULL, line, STR_LIT("AU"))) {
-		molden->coord_unit = MD_MOLDEN_COORD_UNIT_AU;
-	} else {
-		molden->coord_unit = MD_MOLDEN_COORD_UNIT_ANGS;
-	}
+	MD_LOG_DEBUG("Entered parse_atoms_block");
 
 	// Read all atom lines into temporary storage
 	str_t atom_lines[256];  // Max 256 atoms
 	size_t atom_count = 0;
 	
 	while (md_buffered_reader_extract_line(&line, reader) && atom_count < 256) {
+		MD_LOG_DEBUG("parse_atoms_block: read line: %.*s", (int)MIN(line.len, 50), line.ptr);
 		line = str_trim(line);
 		if (line.len == 0) continue;
 		if (line.ptr[0] == '[') {
 			// Hit next block
+			MD_LOG_DEBUG("parse_atoms_block: hit next block marker");
 			break;
 		}
 		atom_lines[atom_count++] = line;
 	}
+
+	MD_LOG_DEBUG("parse_atoms_block: read %zu atoms", atom_count);
 
 	if (atom_count == 0) {
 		MD_LOG_ERROR("No atoms found in [Atoms] block");
@@ -1037,9 +1030,9 @@ static bool parse_atoms_block(md_molden_t* molden, md_buffered_reader_t* reader)
 		molden->atomic_numbers[atom_idx] = (md_element_t)atomic_num;
 
 		// Parse coordinates (tokens 3, 4, 5)
-		double x = parse_double(tokens[3]);
-		double y = parse_double(tokens[4]);
-		double z = parse_double(tokens[5]);
+		double x = parse_float(tokens[3]);
+		double y = parse_float(tokens[4]);
+		double z = parse_float(tokens[5]);
 
 		// Convert to Ångström if needed
 		if (molden->coord_unit == MD_MOLDEN_COORD_UNIT_AU) {
@@ -1093,13 +1086,13 @@ static bool parse_gto_block(md_molden_t* molden, md_buffered_reader_t* reader) {
 			break;
 		}
 
-		size_t num_tokens = extract_tokens(tokens, ARRAY_SIZE(tokens), line, ' ');
+		str_t line_copy = line; size_t num_tokens = extract_tokens(tokens, ARRAY_SIZE(tokens), &line_copy);
 		if (num_tokens < 1) continue;
 
 		// Check if this is an atom index line (two numbers)
 		if (num_tokens == 2) {
 			int atom_idx, dummy;
-			if (parse_int(&atom_idx, tokens[0]) && parse_int(&dummy, tokens[1])) {
+			atom_idx = (int)parse_int(tokens[0]); dummy = (int)parse_int(tokens[1]); if (atom_idx != 0 && dummy != 0) {
 				current_atom_idx = atom_idx;
 				if (current_atom_idx >= 1 && current_atom_idx <= (int)molden->number_of_atoms) {
 					current_atomic_num = molden->atomic_numbers[current_atom_idx - 1];
@@ -1122,7 +1115,7 @@ static bool parse_gto_block(md_molden_t* molden, md_buffered_reader_t* reader) {
 			if (angl_type < 0) continue;
 
 			int num_primitives = 0;
-			if (!parse_int(&num_primitives, tokens[1]) || num_primitives <= 0) {
+			num_primitives = (int)parse_int(tokens[1]); if (num_primitives <= 0) {
 				MD_LOG_ERROR("Invalid number of primitives in GTO block");
 				return false;
 			}
@@ -1158,7 +1151,8 @@ static bool parse_gto_block(md_molden_t* molden, md_buffered_reader_t* reader) {
 					continue;
 				}
 
-				size_t prim_tokens = extract_tokens(tokens, ARRAY_SIZE(tokens), line, ' ');
+				str_t line_copy2 = line;
+				size_t prim_tokens = extract_tokens(tokens, ARRAY_SIZE(tokens), &line_copy2);
 				if (prim_tokens < 2) {
 					MD_LOG_ERROR("Invalid primitive line in GTO block");
 					return false;
@@ -1169,11 +1163,8 @@ static bool parse_gto_block(md_molden_t* molden, md_buffered_reader_t* reader) {
 					return false;
 				}
 
-				double exponent, coefficient;
-				if (!parse_double(&exponent, tokens[0]) || !parse_double(&coefficient, tokens[1])) {
-					MD_LOG_ERROR("Failed to parse GTO primitive parameters");
-					return false;
-				}
+				double exponent = parse_float(tokens[0]);
+				double coefficient = parse_float(tokens[1]);
 
 				basis_set->param.exponents[basis_set->param.count] = exponent;
 				basis_set->param.coefficients[basis_set->param.count] = coefficient;
@@ -1189,162 +1180,161 @@ static bool parse_gto_block(md_molden_t* molden, md_buffered_reader_t* reader) {
 }
 
 static bool parse_mo_block(md_molden_t* molden, md_buffered_reader_t* reader) {
-	md_allocator_i* alloc = molden->arena;
-	str_t line;
-	str_t tokens[10];
+md_allocator_i* alloc = molden->arena;
+str_t line;
+str_t tokens[10];
 
-	// First pass: count MOs
-	int64_t start_pos = md_buffered_reader_tellg(reader);
-	size_t num_mos = 0;
-	size_t num_aos = 0;
-	
-	while (md_buffered_reader_extract_line(&line, reader)) {
-		line = str_trim(line);
-		if (line.len == 0) continue;
-		if (line.ptr[0] == '[') break;
-		
-		if (str_find_str(line, STR_LIT("Sym="), 0, NULL)) {
-			num_mos++;
-		} else if (num_mos == 1 && num_aos == 0) {
-			// Count AO coefficients in first MO
-			size_t num_tokens = extract_tokens(tokens, ARRAY_SIZE(tokens), line, ' ');
-			if (num_tokens >= 2) {
-				int idx;
-				double coeff;
-				if (parse_int(&idx, tokens[0]) && parse_double(&coeff, tokens[1])) {
-					num_aos = MAX(num_aos, (size_t)idx);
-				}
-			}
-		}
-	}
+// Read all MO lines into temporary storage
+str_t mo_lines[2048];  // Max 2048 lines for MO block
+size_t line_count = 0;
 
-	if (num_mos == 0 || num_aos == 0) {
-		MD_LOG_ERROR("No molecular orbitals found in [MO] block");
-		return false;
-	}
+while (md_buffered_reader_extract_line(&line, reader) && line_count < 2048) {
+line = str_trim(line);
+if (line.len == 0) continue;
+if (line.ptr[0] == '[') break;
+mo_lines[line_count++] = line;
+}
 
-	// Allocate MO data
-	molden->scf.alpha.coefficients.size[0] = num_aos;
-	molden->scf.alpha.coefficients.size[1] = num_mos;
-	molden->scf.alpha.coefficients.data = md_alloc(alloc, num_aos * num_mos * sizeof(double));
-	molden->scf.alpha.energy.size = num_mos;
-	molden->scf.alpha.energy.data = md_alloc(alloc, num_mos * sizeof(double));
-	molden->scf.alpha.occupancy.size = num_mos;
-	molden->scf.alpha.occupancy.data = md_alloc(alloc, num_mos * sizeof(double));
-	molden->scf.alpha.symmetry = md_alloc(alloc, num_mos * sizeof(str_t));
-	molden->scf.alpha.spin = md_alloc(alloc, num_mos * sizeof(str_t));
+// First pass: count MOs and AOs
+size_t num_mos = 0;
+size_t num_aos = 0;
 
-	if (!molden->scf.alpha.coefficients.data || !molden->scf.alpha.energy.data || 
-	    !molden->scf.alpha.occupancy.data || !molden->scf.alpha.symmetry || !molden->scf.alpha.spin) {
-		MD_LOG_ERROR("Failed to allocate memory for MO data");
-		return false;
-	}
+for (size_t i = 0; i < line_count; i++) {
+line = mo_lines[i];
 
-	MEMSET(molden->scf.alpha.coefficients.data, 0, num_aos * num_mos * sizeof(double));
-	MEMSET(molden->scf.alpha.energy.data, 0, num_mos * sizeof(double));
-	MEMSET(molden->scf.alpha.occupancy.data, 0, num_mos * sizeof(double));
-	MEMSET(molden->scf.alpha.symmetry, 0, num_mos * sizeof(str_t));
-	MEMSET(molden->scf.alpha.spin, 0, num_mos * sizeof(str_t));
+if (str_find_str(NULL, line, STR_LIT("Sym="))) {
+num_mos++;
+} else if (num_mos == 1 && num_aos == 0) {
+// Count AO coefficients in first MO
+str_t line_copy = line; 
+size_t num_tokens = extract_tokens(tokens, ARRAY_SIZE(tokens), &line_copy);
+if (num_tokens >= 2) {
+int idx = (int)parse_int(tokens[0]);
+num_aos = MAX(num_aos, (size_t)idx);
+}
+}
+}
 
-	// Reset and parse MOs
-	md_buffered_reader_seekg(reader, start_pos);
-	
-	size_t mo_idx = 0;
-	str_t current_sym = {0};
-	double current_ene = 0.0;
-	str_t current_spin = {0};
-	double current_occup = 0.0;
-	size_t ao_idx = 0;
+if (num_mos == 0 || num_aos == 0) {
+MD_LOG_ERROR("No molecular orbitals found in [MO] block");
+return false;
+}
 
-	while (md_buffered_reader_extract_line(&line, reader) && mo_idx < num_mos) {
-		line = str_trim(line);
-		if (line.len == 0) continue;
-		if (line.ptr[0] == '[') break;
+// Allocate MO data
+molden->scf.alpha.coefficients.size[0] = num_aos;
+molden->scf.alpha.coefficients.size[1] = num_mos;
+molden->scf.alpha.coefficients.data = md_alloc(alloc, num_aos * num_mos * sizeof(double));
+molden->scf.alpha.energy.size = num_mos;
+molden->scf.alpha.energy.data = md_alloc(alloc, num_mos * sizeof(double));
+molden->scf.alpha.occupancy.size = num_mos;
+molden->scf.alpha.occupancy.data = md_alloc(alloc, num_mos * sizeof(double));
+molden->scf.alpha.symmetry = md_alloc(alloc, num_mos * sizeof(str_t));
+molden->scf.alpha.spin = md_alloc(alloc, num_mos * sizeof(str_t));
 
-		// Parse MO properties
-		if (str_find_str(line, STR_LIT("Sym="), 0, NULL)) {
-			// Start of new MO
-			if (mo_idx > 0 || ao_idx > 0) {
-				// Finalize previous MO
-				molden->scf.alpha.symmetry[mo_idx] = current_sym;
-				molden->scf.alpha.spin[mo_idx] = current_spin;
-				molden->scf.alpha.energy.data[mo_idx] = current_ene;
-				molden->scf.alpha.occupancy.data[mo_idx] = current_occup;
-				mo_idx++;
-			}
-			
-			// Parse symmetry label
-			size_t eq_pos;
-			if (str_find_char(&eq_pos, line, '=')) {
-				current_sym = str_trim(str_substr(line, eq_pos + 1, line.len));
-				current_sym = str_copy(current_sym, alloc);
-			}
-			ao_idx = 0;
-			
-		} else if (str_find_str(line, STR_LIT("Ene="), 0, NULL)) {
-			size_t eq_pos;
-			if (str_find_char(&eq_pos, line, '=')) {
-				str_t value = str_trim(str_substr(line, eq_pos + 1, line.len));
-				parse_double(&current_ene, value);
-			}
-			
-		} else if (str_find_str(line, STR_LIT("Spin="), 0, NULL)) {
-			size_t eq_pos;
-			if (str_find_char(&eq_pos, line, '=')) {
-				current_spin = str_trim(str_substr(line, eq_pos + 1, line.len));
-				current_spin = str_copy(current_spin, alloc);
-			}
-			
-		} else if (str_find_str(line, STR_LIT("Occup="), 0, NULL)) {
-			size_t eq_pos;
-			if (str_find_char(&eq_pos, line, '=')) {
-				str_t value = str_trim(str_substr(line, eq_pos + 1, line.len));
-				parse_double(&current_occup, value);
-			}
-			
-		} else {
-			// Parse coefficient
-			size_t num_tokens = extract_tokens(tokens, ARRAY_SIZE(tokens), line, ' ');
-			if (num_tokens >= 2) {
-				int idx;
-				double coeff;
-				if (parse_int(&idx, tokens[0]) && parse_double(&coeff, tokens[1])) {
-					if (idx >= 1 && idx <= (int)num_aos && mo_idx < num_mos) {
-						molden->scf.alpha.coefficients.data[(idx - 1) * num_mos + mo_idx] = coeff;
-					}
-				}
-			}
-		}
-	}
+if (!molden->scf.alpha.coefficients.data || !molden->scf.alpha.energy.data || 
+    !molden->scf.alpha.occupancy.data || !molden->scf.alpha.symmetry || !molden->scf.alpha.spin) {
+MD_LOG_ERROR("Failed to allocate memory for MO data");
+return false;
+}
 
-	// Finalize last MO
-	if (mo_idx < num_mos) {
-		molden->scf.alpha.symmetry[mo_idx] = current_sym;
-		molden->scf.alpha.spin[mo_idx] = current_spin;
-		molden->scf.alpha.energy.data[mo_idx] = current_ene;
-		molden->scf.alpha.occupancy.data[mo_idx] = current_occup;
-	}
+MEMSET(molden->scf.alpha.coefficients.data, 0, num_aos * num_mos * sizeof(double));
+MEMSET(molden->scf.alpha.energy.data, 0, num_mos * sizeof(double));
+MEMSET(molden->scf.alpha.occupancy.data, 0, num_mos * sizeof(double));
+MEMSET(molden->scf.alpha.symmetry, 0, num_mos * sizeof(str_t));
+MEMSET(molden->scf.alpha.spin, 0, num_mos * sizeof(str_t));
 
-	// Calculate HOMO/LUMO indices and electron count
-	molden->scf.type = MD_MOLDEN_SCF_TYPE_RESTRICTED;
-	molden->scf.homo_idx[0] = 0;
-	molden->scf.lumo_idx[0] = 0;
-	
-	size_t num_alpha_electrons = 0;
-	for (size_t i = 0; i < num_mos; i++) {
-		if (molden->scf.alpha.occupancy.data[i] > 0.5) {
-			molden->scf.homo_idx[0] = i;
-			num_alpha_electrons += (size_t)molden->scf.alpha.occupancy.data[i];
-		} else if (molden->scf.lumo_idx[0] == 0 || molden->scf.lumo_idx[0] == molden->scf.homo_idx[0]) {
-			molden->scf.lumo_idx[0] = i;
-		}
-	}
-	
-	molden->number_of_alpha_electrons = num_alpha_electrons;
-	molden->number_of_beta_electrons = num_alpha_electrons;  // Restricted calc
-	molden->spin_multiplicity = 1;
+// Second pass: parse MOs
+size_t mo_idx = 0;
+str_t current_sym = {0};
+double current_ene = 0.0;
+str_t current_spin = {0};
+double current_occup = 0.0;
 
-	return true;
+for (size_t i = 0; i < line_count && mo_idx <= num_mos; i++) {
+line = mo_lines[i];
+
+// Parse MO properties
+if (str_find_str(NULL, line, STR_LIT("Sym="))) {
+// Start of new MO
+if (mo_idx > 0) {
+// Finalize previous MO
+molden->scf.alpha.symmetry[mo_idx - 1] = current_sym;
+molden->scf.alpha.spin[mo_idx - 1] = current_spin;
+molden->scf.alpha.energy.data[mo_idx - 1] = current_ene;
+molden->scf.alpha.occupancy.data[mo_idx - 1] = current_occup;
+}
+mo_idx++;
+
+// Parse symmetry label
+size_t eq_pos;
+if (str_find_char(&eq_pos, line, '=')) {
+current_sym = str_trim(str_substr(line, eq_pos + 1, line.len));
+current_sym = str_copy(current_sym, alloc);
+}
+
+} else if (str_find_str(NULL, line, STR_LIT("Ene="))) {
+size_t eq_pos;
+if (str_find_char(&eq_pos, line, '=')) {
+str_t value = str_trim(str_substr(line, eq_pos + 1, line.len));
+current_ene = parse_float(value);
+}
+
+} else if (str_find_str(NULL, line, STR_LIT("Spin="))) {
+size_t eq_pos;
+if (str_find_char(&eq_pos, line, '=')) {
+current_spin = str_trim(str_substr(line, eq_pos + 1, line.len));
+current_spin = str_copy(current_spin, alloc);
+}
+
+} else if (str_find_str(NULL, line, STR_LIT("Occup="))) {
+size_t eq_pos;
+if (str_find_char(&eq_pos, line, '=')) {
+str_t value = str_trim(str_substr(line, eq_pos + 1, line.len));
+current_occup = parse_float(value);
+}
+
+} else {
+// Parse coefficient
+str_t line_copy = line; 
+size_t num_tokens = extract_tokens(tokens, ARRAY_SIZE(tokens), &line_copy);
+if (num_tokens >= 2 && mo_idx > 0) {
+int idx = (int)parse_int(tokens[0]);
+double coeff = parse_float(tokens[1]);
+if (idx >= 1 && idx <= (int)num_aos && mo_idx - 1 < num_mos) {
+molden->scf.alpha.coefficients.data[(idx - 1) * num_mos + (mo_idx - 1)] = coeff;
+}
+}
+}
+}
+
+// Finalize last MO
+if (mo_idx > 0 && mo_idx <= num_mos) {
+molden->scf.alpha.symmetry[mo_idx - 1] = current_sym;
+molden->scf.alpha.spin[mo_idx - 1] = current_spin;
+molden->scf.alpha.energy.data[mo_idx - 1] = current_ene;
+molden->scf.alpha.occupancy.data[mo_idx - 1] = current_occup;
+}
+
+// Calculate HOMO/LUMO indices and electron count
+molden->scf.type = MD_MOLDEN_SCF_TYPE_RESTRICTED;
+molden->scf.homo_idx[0] = 0;
+molden->scf.lumo_idx[0] = 0;
+
+size_t num_alpha_electrons = 0;
+for (size_t i = 0; i < num_mos; i++) {
+if (molden->scf.alpha.occupancy.data[i] > 0.5) {
+molden->scf.homo_idx[0] = i;
+num_alpha_electrons += (size_t)molden->scf.alpha.occupancy.data[i];
+} else if (molden->scf.lumo_idx[0] == 0 || molden->scf.lumo_idx[0] == molden->scf.homo_idx[0]) {
+molden->scf.lumo_idx[0] = i;
+}
+}
+
+molden->number_of_alpha_electrons = num_alpha_electrons;
+molden->number_of_beta_electrons = num_alpha_electrons;  // Restricted calc
+molden->spin_multiplicity = 1;
+
+return true;
 }
 
 static bool parse_molden_file(md_molden_t* molden, str_t filename) {
@@ -1353,6 +1343,8 @@ static bool parse_molden_file(md_molden_t* molden, str_t filename) {
 		MD_LOG_ERROR("Failed to open Molden file: %.*s", (int)filename.len, filename.ptr);
 		return false;
 	}
+
+	MD_LOG_DEBUG("Opened Molden file successfully");
 
 	char* buf = md_alloc(md_get_temp_allocator(), MEGABYTES(4));
 	if (!buf) {
@@ -1369,42 +1361,67 @@ static bool parse_molden_file(md_molden_t* molden, str_t filename) {
 	bool found_gto = false;
 	bool found_mo = false;
 
+	MD_LOG_DEBUG("Starting to read lines from file");
+	
+	int line_count = 0;
 	while (md_buffered_reader_extract_line(&line, &reader)) {
+		line_count++;
+		if (line_count < 10) {
+			MD_LOG_DEBUG("Read line %d: %.*s", line_count, (int)MIN(line.len, 50), line.ptr);
+		}
 		line = str_trim(line);
 		if (line.len == 0) continue;
 
 		// Check for block headers
 		if (str_eq_ignore_case(line, STR_LIT("[5D]"))) {
 			molden->use_5d = true;
+			MD_LOG_DEBUG("Found [5D] marker");
 		} else if (str_eq_ignore_case(line, STR_LIT("[7F]"))) {
 			molden->use_7f = true;
+			MD_LOG_DEBUG("Found [7F] marker");
 		} else if (str_eq_ignore_case(line, STR_LIT("[9G]"))) {
 			molden->use_9g = true;
-		} else if (str_find_str_ignore_case(line, STR_LIT("[Atoms]"), 0, NULL)) {
+			MD_LOG_DEBUG("Found [9G] marker");
+		} else if (str_begins_with(line, STR_LIT("[Atoms]")) || str_begins_with(line, STR_LIT("[atoms]")) || str_begins_with(line, STR_LIT("[ATOMS]"))) {
+			MD_LOG_DEBUG("Parsing [Atoms] block");
+			// Determine coordinate unit from the [Atoms] line
+			if (str_find_str(NULL, line, STR_LIT("AU"))) {
+				molden->coord_unit = MD_MOLDEN_COORD_UNIT_AU;
+			} else {
+				molden->coord_unit = MD_MOLDEN_COORD_UNIT_ANGS;
+			}
+			
 			if (!parse_atoms_block(molden, &reader)) {
 				MD_LOG_ERROR("Failed to parse [Atoms] block");
 				success = false;
 				break;
 			}
+			MD_LOG_DEBUG("Successfully parsed [Atoms] block with %zu atoms", molden->number_of_atoms);
 			found_atoms = true;
 		} else if (str_eq_ignore_case(line, STR_LIT("[GTO]"))) {
+			MD_LOG_DEBUG("Parsing [GTO] block");
 			if (!parse_gto_block(molden, &reader)) {
 				MD_LOG_ERROR("Failed to parse [GTO] block");
 				success = false;
 				break;
 			}
+			MD_LOG_DEBUG("Successfully parsed [GTO] block");
 			found_gto = true;
 		} else if (str_eq_ignore_case(line, STR_LIT("[MO]"))) {
+			MD_LOG_DEBUG("Parsing [MO] block");
 			if (!parse_mo_block(molden, &reader)) {
 				MD_LOG_ERROR("Failed to parse [MO] block");
 				success = false;
 				break;
 			}
+			MD_LOG_DEBUG("Successfully parsed [MO] block");
 			found_mo = true;
 		}
 	}
 
 	md_file_close(file);
+
+	MD_LOG_DEBUG("Parsing complete. Found: atoms=%d, gto=%d, mo=%d", found_atoms, found_gto, found_mo);
 
 	if (success && found_atoms && found_gto) {
 		// Extract GTO data and AO-to-atom mapping
