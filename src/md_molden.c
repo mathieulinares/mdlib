@@ -147,9 +147,9 @@ typedef struct md_molden_t {
 // =============================
 
 static bool parse_molden_file(md_molden_t* molden, str_t filename);
-static bool parse_atoms_block(md_molden_t* molden, md_buffered_reader_t* reader);
-static bool parse_gto_block(md_molden_t* molden, md_buffered_reader_t* reader);
-static bool parse_mo_block(md_molden_t* molden, md_buffered_reader_t* reader);
+static bool parse_atoms_block(md_molden_t* molden, md_buffered_reader_t* reader, str_t* next_block_line);
+static bool parse_gto_block(md_molden_t* molden, md_buffered_reader_t* reader, str_t* next_block_line);
+static bool parse_mo_block(md_molden_t* molden, md_buffered_reader_t* reader, str_t* next_block_line);
 static void normalize_basis_set(basis_set_t* basis_set);
 static void extract_gto_data(md_gto_data_t* out_data, const dvec3_t* atom_coordinates, const md_element_t* atomic_numbers, size_t number_of_atoms, const basis_set_t* basis_set, md_allocator_i* alloc);
 static size_t extract_ao_to_atom_idx(int* out_ao_to_atom, const md_element_t* atomic_numbers, size_t number_of_atoms, const basis_set_t* basis_set);
@@ -973,7 +973,7 @@ static void extract_gto_data(md_gto_data_t* out_data, const dvec3_t* atom_coordi
 	}
 }
 
-static bool parse_atoms_block(md_molden_t* molden, md_buffered_reader_t* reader) {
+static bool parse_atoms_block(md_molden_t* molden, md_buffered_reader_t* reader, str_t* next_block_line) {
 	md_allocator_i* alloc = molden->arena;
 	str_t line;
 
@@ -988,8 +988,9 @@ static bool parse_atoms_block(md_molden_t* molden, md_buffered_reader_t* reader)
 		line = str_trim(line);
 		if (line.len == 0) continue;
 		if (line.ptr[0] == '[') {
-			// Hit next block
+			// Hit next block - save it for main parser
 			MD_LOG_DEBUG("parse_atoms_block: hit next block marker");
+			*next_block_line = line;
 			break;
 		}
 		atom_lines[atom_count++] = line;
@@ -1049,7 +1050,7 @@ static bool parse_atoms_block(md_molden_t* molden, md_buffered_reader_t* reader)
 	return true;
 }
 
-static bool parse_gto_block(md_molden_t* molden, md_buffered_reader_t* reader) {
+static bool parse_gto_block(md_molden_t* molden, md_buffered_reader_t* reader, str_t* next_block_line) {
 	md_allocator_i* alloc = molden->arena;
 	str_t line;
 	str_t tokens[10];
@@ -1083,7 +1084,7 @@ static bool parse_gto_block(md_molden_t* molden, md_buffered_reader_t* reader) {
 		if (line.len == 0) continue;
 		if (line.ptr[0] == '[') {
 			// Hit next block
-			break;
+			*next_block_line = line; break;
 		}
 
 		str_t line_copy = line; size_t num_tokens = extract_tokens(tokens, ARRAY_SIZE(tokens), &line_copy);
@@ -1179,7 +1180,7 @@ static bool parse_gto_block(md_molden_t* molden, md_buffered_reader_t* reader) {
 	return true;
 }
 
-static bool parse_mo_block(md_molden_t* molden, md_buffered_reader_t* reader) {
+static bool parse_mo_block(md_molden_t* molden, md_buffered_reader_t* reader, str_t* next_block_line) {
 md_allocator_i* alloc = molden->arena;
 str_t line;
 str_t tokens[10];
@@ -1360,11 +1361,13 @@ static bool parse_molden_file(md_molden_t* molden, str_t filename) {
 	bool found_atoms = false;
 	bool found_gto = false;
 	bool found_mo = false;
+	str_t next_block = {0};
 
 	MD_LOG_DEBUG("Starting to read lines from file");
 	
 	int line_count = 0;
 	while (md_buffered_reader_extract_line(&line, &reader)) {
+process_line:
 		line_count++;
 		if (line_count < 10) {
 			MD_LOG_DEBUG("Read line %d: %.*s", line_count, (int)MIN(line.len, 50), line.ptr);
@@ -1391,25 +1394,27 @@ static bool parse_molden_file(md_molden_t* molden, str_t filename) {
 				molden->coord_unit = MD_MOLDEN_COORD_UNIT_ANGS;
 			}
 			
-			if (!parse_atoms_block(molden, &reader)) {
+			if (!parse_atoms_block(molden, &reader, &next_block)) {
 				MD_LOG_ERROR("Failed to parse [Atoms] block");
 				success = false;
 				break;
 			}
 			MD_LOG_DEBUG("Successfully parsed [Atoms] block with %zu atoms", molden->number_of_atoms);
 			found_atoms = true;
+			if (next_block.len > 0) { line = next_block; next_block.len = 0; goto process_line; }
 		} else if (str_eq_ignore_case(line, STR_LIT("[GTO]"))) {
 			MD_LOG_DEBUG("Parsing [GTO] block");
-			if (!parse_gto_block(molden, &reader)) {
+			if (!parse_gto_block(molden, &reader, &next_block)) {
 				MD_LOG_ERROR("Failed to parse [GTO] block");
 				success = false;
 				break;
 			}
 			MD_LOG_DEBUG("Successfully parsed [GTO] block");
 			found_gto = true;
+			if (next_block.len > 0) { line = next_block; next_block.len = 0; goto process_line; }
 		} else if (str_eq_ignore_case(line, STR_LIT("[MO]"))) {
 			MD_LOG_DEBUG("Parsing [MO] block");
-			if (!parse_mo_block(molden, &reader)) {
+			if (!parse_mo_block(molden, &reader, &next_block)) {
 				MD_LOG_ERROR("Failed to parse [MO] block");
 				success = false;
 				break;
