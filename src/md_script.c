@@ -2244,6 +2244,15 @@ ast_node_t* parse_identifier(parse_context_t* ctx) {
             if (!reject_named_arguments(ctx, node)) return NULL;
             node->type = AST_TRANSPOSE;
         }
+    } else if (str_eq(ident, STR_LIT("ramachandran_weights")) || str_eq(ident, STR_LIT("shapespace_weights"))) {
+        // The rows of ramachandran() and shapespace() with one array per component, ready to destructure: transpose(<procedure>(...))
+        node = parse_procedure_call(ctx, token);
+        if (node) {
+            node->ident = str_substr(node->ident, 0, node->ident.len - STR_LIT("_weights").len);
+            ast_node_t* transpose = create_node(ctx->ir, AST_TRANSPOSE, node->token);
+            md_array_push(transpose->children, node, ctx->ir->arena);
+            node = transpose;
+        }
     } else if (is_identifier_procedure(ident)) {
         // The identifier has matched some procedure name
         node = parse_procedure_call(ctx, token);
@@ -3194,7 +3203,8 @@ static bool evaluate_assignment(data_t* dst, const ast_node_t* node, eval_contex
 
         for (int i = 0; i < count; ++i) {
             ast_node_t* child = lhs->children[i];
-            int stride = (int)type_info_element_byte_stride(child->data.type);
+            // The whole of what the identifier holds, which for a component array [N] is N values, not one
+            int stride = (int)type_info_total_byte_size(child->data.type);
             ASSERT(child->type == AST_IDENTIFIER);
             identifier_t* ident = find_dynamic_identifier(child->ident, ctx);
 
@@ -5569,8 +5579,13 @@ static inline bool is_volume_type(type_info_t ti) {
     return ti.dim[0] != -1 && is_type_directly_compatible(ti, (type_info_t)TI_VOLUME);
 }
 
+// A vector for each of N members, e.g. the (phi, psi) of every residue: float[N][2..4]
+static inline bool is_vector_type(type_info_t ti) {
+    return ti.base_type == TYPE_FLOAT && ti.dim[0] != -1 && dim_ndims(ti.dim) == 2 && ti.dim[1] >= 2 && ti.dim[1] <= 4;
+}
+
 static inline bool is_property_type(type_info_t ti) {
-    return is_temporal_type(ti) || is_distribution_type(ti) || is_volume_type(ti);
+    return is_temporal_type(ti) || is_distribution_type(ti) || is_volume_type(ti) || is_vector_type(ti);
 }
 
 static bool static_eval_node(ast_node_t* node, eval_context_t* ctx) {
@@ -5816,6 +5831,16 @@ static void init_property(eval_property_t* prop, md_attributes_t* attributes, st
             }
             break;
         }
+        case MD_SCRIPT_PROPERTY_FLAG_VECTOR: {
+            // Shaped {num_frames, N} with a vector for each member: the values of a frame are N consecutive vectors
+            const uint32_t shape[2] = { (uint32_t)num_frames, (uint32_t)type.dim[0] };
+            const uint32_t components = (uint32_t)type.dim[1];
+            prop->count      = shape[1] * components;
+            prop->num_values = (size_t)shape[0] * (size_t)prop->count;
+            prop->values = script_attr_storage(attributes, alloc, ident, NULL, value_unit, MD_ATTRIBUTE_FLAG_TEMPORAL, components, 2, shape);
+            prop->range  = (vec2_t*)script_attr_storage(attributes, alloc, ident, "/range", value_unit, MD_ATTRIBUTE_FLAG_NONE, 2, 0, NULL);
+            break;
+        }
         case MD_SCRIPT_PROPERTY_FLAG_DISTRIBUTION: {
             // The evaluated type is [1][2][num_bins]: the values followed by their weights.
             if (dim_ndims(type.dim) < 3) {
@@ -6056,6 +6081,23 @@ static bool eval_properties(md_script_eval_t* eval, const md_system_t* sys, str_
                 md_mutex_unlock(&prop->accum_mutex);
                 break;
             }
+            case MD_SCRIPT_PROPERTY_FLAG_VECTOR: {
+                const size_t count = prop->count;
+                const size_t evaluated = (size_t)ident->data->type.dim[0] * (size_t)ident->data->type.dim[1];
+                ASSERT(evaluated == count);
+                MEMCPY(prop->values + (size_t)f_idx * count, values, MIN(evaluated, count) * sizeof(float));
+
+                float min, max, mean, var;
+                compute_min_max_mean_variance(&min, &max, &mean, &var, values, MIN(evaluated, count));
+
+                md_mutex_lock(&prop->accum_mutex);
+                prop->min_value = MIN(prop->min_value, min);
+                prop->max_value = MAX(prop->max_value, max);
+                prop->range->x = (value_range.beg == -FLT_MAX) ? prop->min_value : value_range.beg;
+                prop->range->y = (value_range.end == +FLT_MAX) ? prop->max_value : value_range.end;
+                md_mutex_unlock(&prop->accum_mutex);
+                break;
+            }
             case MD_SCRIPT_PROPERTY_FLAG_DISTRIBUTION: {
                 const size_t num_bins = prop->count;
                 float min, max, mean, var;
@@ -6275,6 +6317,7 @@ static bool create_property(md_script_ir_t* ir, str_t ident, const ast_node_t* n
         is_temporal_type(type)     ? MD_SCRIPT_PROPERTY_FLAG_TEMPORAL :
         is_distribution_type(type) ? MD_SCRIPT_PROPERTY_FLAG_DISTRIBUTION :
         is_volume_type(type)       ? MD_SCRIPT_PROPERTY_FLAG_VOLUME :
+        is_vector_type(type)       ? MD_SCRIPT_PROPERTY_FLAG_VECTOR :
                                      MD_SCRIPT_PROPERTY_FLAG_NONE;
     ASSERT(flags != MD_SCRIPT_PROPERTY_FLAG_NONE);
 
@@ -7319,7 +7362,7 @@ static const str_t script_keywords[] = {
 
 // Procedures that the parser handles itself instead of looking them up in the procedure table
 static const str_t script_intrinsics[] = {
-    STR_INIT("attr"), STR_INIT("flatten"), STR_INIT("transpose"),
+    STR_INIT("attr"), STR_INIT("flatten"), STR_INIT("transpose"), STR_INIT("ramachandran_weights"), STR_INIT("shapespace_weights"),
 };
 
 

@@ -275,8 +275,11 @@ Constants, plain selections (a `bitfield`), strings and ranges are *not* propert
 statements. The engine publishes each property under the attribute `script/<name>`. A script with no property at
 all (`a = count(protein());`, which is constant) cannot be evaluated and reports "no properties".
 
-Some values have no property form yet: `float[2]`/`float[3]` arrays (`coord`, `coord_xy`, `shape_weights` without
-destructuring) and the combined `density(...)` cannot be plotted directly — use them as inputs to other procedures
+A `float[N][2]`, `float[N][3]` or `float[N][4]` array is a property too, with a vector per member (`ramachandran`,
+`shapespace`, `coord`, `coord_xy`, `shape_weights`): it is stored for every frame and published with that many
+components, but a plot of a single value over time does not apply to it.
+
+Some values have no property form yet: the combined `density(...)` cannot be plotted directly — use it as an input to other procedures
 or [destructure](#statements-and-comments) them.
 
 ---
@@ -291,7 +294,7 @@ or [destructure](#statements-and-comments) them.
 | [Selectors: structure matching](#selectors-structure-matching) | [`smiles`](#smiles), [`match`](#match) |
 | [Selectors: spatial](#selectors-spatial) | [`within`](#within), [`within_x`](#within_x), [`within_y`](#within_y), [`within_z`](#within_z), [`within_xyz`](#within_xyz) |
 | [Properties](#properties) | [`distance`](#distance), [`distance_min`](#distance_min), [`distance_max`](#distance_max), [`distance_pair`](#distance_pair), [`angle`](#angle), [`dihedral`](#dihedral), [`rmsd`](#rmsd), [`rdf`](#rdf), [`density_x`](#density_x) / [`density_y`](#density_y) / [`density_z`](#density_z), [`density`](#density), [`sdf`](#sdf), [`count`](#count), [`contact_count`](#contact_count), [`contacts`](#contacts), [`degree`](#degree), [`porosity`](#porosity) |
-| [Geometry](#geometry) | [`com`](#com), [`plane`](#plane), [`shape_weights`](#shape_weights), [`coord`](#coord), [`coord_x`](#coord_x) / [`coord_y`](#coord_y) / [`coord_z`](#coord_z), [`coord_xy`](#coord_xy) / [`coord_xz`](#coord_xz) / [`coord_yz`](#coord_yz) |
+| [Geometry](#geometry) | [`com`](#com), [`plane`](#plane), [`shape_weights`](#shape_weights), [`shapespace`](#shapespace) / [`shapespace_weights`](#shapespace_weights), [`ramachandran`](#ramachandran) / [`ramachandran_weights`](#ramachandran_weights), [`coord`](#coord), [`coord_x`](#coord_x) / [`coord_y`](#coord_y) / [`coord_z`](#coord_z), [`coord_xy`](#coord_xy) / [`coord_xz`](#coord_xz) / [`coord_yz`](#coord_yz) |
 | [Math](#math) | [`sqrt`](#sqrt), [`cbrt`](#cbrt), [`abs`](#abs), [`floor`](#floor), [`ceil`](#ceil), [`sin`](#sin), [`cos`](#cos), [`asin`](#asin), [`acos`](#acos), [`atan`](#atan), [`atan2`](#atan2), [`log`](#log), [`log2`](#log2), [`log10`](#log10), [`exp`](#exp), [`exp2`](#exp2), [`pow`](#pow), [`min`](#min), [`max`](#max) |
 | [Linear algebra](#linear-algebra-and-constructors) | [`vec2`](#vec2), [`vec3`](#vec3), [`vec4`](#vec4), [`dot`](#dot), [`cross`](#cross), [`length`](#length), [`normalize`](#normalize), [`mul`](#mul) |
 | [Combining](#combining-and-reshaping) | [`join`](#join) (`flatten`), [`split`](#split), [`chunks`](#chunks), [`transpose`](#transpose), and the operators `and` `or` `xor` `not` on selections |
@@ -1348,6 +1351,73 @@ sum to 1: `(linear, planar, isotropic)`. Destructure the result to get them as s
 
 ```mdscript
 {lin, plan, iso} = shape_weights(all());
+```
+
+### shapespace
+
+<!-- proc name=shapespace category=geometry -->
+
+```text
+shapespace(a: position[]) -> float[N][3]
+shapespace() -> float[1][3]
+```
+
+The shape of every group in `a` (every residue of `resid(1:4)`, the whole of `join(resid(1:4))`), as `(linear, planar, isotropic)` weights (see [`shape_weights`](#shape_weights)),
+one row per group. Without an argument it is the shape of the whole system. The result is a property: it is
+stored for every frame, and the Shape space window shows the properties of this kind.
+
+```mdscript
+sp = shapespace(resid(1:4));
+```
+
+### shapespace_weights
+
+<!-- proc name=shapespace_weights category=geometry -->
+
+```text
+shapespace_weights(a: position[]) -> float[3][N]
+shapespace_weights() -> float[3][1]
+```
+
+[`shapespace`](#shapespace) with one array per component instead of one row per group, so that it destructures
+directly, without a [`transpose`](#transpose).
+
+```mdscript
+{lin, plan, iso} = shapespace_weights(residue(1:4));
+```
+
+### ramachandran
+
+<!-- proc name=ramachandran category=geometry -->
+
+```text
+ramachandran(a: bitfield[]) -> float[N][2] [rad]
+ramachandran() -> float[N][2] [rad]
+```
+
+The backbone angles `(phi, psi)` of every residue of a protein that holds an atom of `a`, one row per residue in
+the order of the system. Without an argument it is every residue. A residue at the end of a chain has no defined
+angles and is left out. The result is a property: it is stored for every frame, and the Ramachandran window
+shows the properties of this kind.
+
+```mdscript
+rama = ramachandran(resid(1:4));
+```
+
+### ramachandran_weights
+
+<!-- proc name=ramachandran_weights category=geometry -->
+
+```text
+ramachandran_weights(a: bitfield[]) -> float[2][N] [rad]
+ramachandran_weights() -> float[2][N] [rad]
+```
+
+[`ramachandran`](#ramachandran) with one array per angle instead of one row per residue, so that it destructures
+directly, without a [`transpose`](#transpose).
+
+```mdscript
+{phi, psi} = ramachandran_weights(resid(1:4));
 ```
 
 ### coord

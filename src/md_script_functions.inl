@@ -448,6 +448,9 @@ static int _coordinate_xz(data_t*, data_t[], eval_context_t*);  // (position[]) 
 static int _coordinate_yz(data_t*, data_t[], eval_context_t*);  // (position[]) -> float2[]
 
 static int _shape_weights(data_t*, data_t[], eval_context_t*); // (position[]) -> float
+static int _shapespace_all (data_t*, data_t[], eval_context_t*); // () -> float[1][3]
+static int _ramachandran    (data_t*, data_t[], eval_context_t*); // (bitfield[]) -> float[N][2]
+static int _ramachandran_all(data_t*, data_t[], eval_context_t*); // () -> float[N][2]
 
 // Linear algebra
 static int _dot           (data_t*, data_t[], eval_context_t*); // (float[], float[]) -> float
@@ -780,6 +783,12 @@ static procedure_t procedures[] = {
     {STR_INIT("com"),           TI_FLOAT3,      1,  {TI_COORDINATE_ARR},  _com,           FLAG_DYNAMIC | FLAG_STATIC_VALIDATION | FLAG_VISUALIZE },
     {STR_INIT("plane"),         TI_FLOAT4,      1,  {TI_COORDINATE_ARR},  _plane,         FLAG_DYNAMIC | FLAG_STATIC_VALIDATION | FLAG_VISUALIZE },
     {STR_INIT("shape_weights"), TI_FLOAT3_ARR,  1,  {TI_COORDINATE_ARR},  _shape_weights, FLAG_DYNAMIC | FLAG_STATIC_VALIDATION | FLAG_QUERYABLE_LENGTH | FLAG_VISUALIZE},
+    // One (linear, planar, isotropic) row per group. shapespace_weights() is the same transposed, see the parser
+    {STR_INIT("shapespace"),    TI_FLOAT3_ARR,  1,  {TI_COORDINATE_ARR},  _shape_weights, FLAG_DYNAMIC | FLAG_STATIC_VALIDATION | FLAG_QUERYABLE_LENGTH | FLAG_VISUALIZE},
+    {STR_INIT("shapespace"),    TI_FLOAT3_ARR,  0,  {0},                  _shapespace_all, FLAG_DYNAMIC | FLAG_STATIC_VALIDATION | FLAG_QUERYABLE_LENGTH},
+    // One (phi, psi) row per residue of the protein backbone that the selection touches. ramachandran_weights() is the same transposed, see the parser
+    {STR_INIT("ramachandran"),  TI_FLOAT2_ARR,  1,  {TI_BITFIELD_ARR},    _ramachandran,   FLAG_DYNAMIC | FLAG_STATIC_VALIDATION | FLAG_QUERYABLE_LENGTH | FLAG_VISUALIZE},
+    {STR_INIT("ramachandran"),  TI_FLOAT2_ARR,  0,  {0},                  _ramachandran_all, FLAG_DYNAMIC | FLAG_STATIC_VALIDATION | FLAG_QUERYABLE_LENGTH},
 
     {STR_INIT("coord"),      TI_FLOAT3_ARR,  1,  {TI_COORDINATE_ARR},  _coordinate,      FLAG_DYNAMIC | FLAG_STATIC_VALIDATION | FLAG_QUERYABLE_LENGTH | FLAG_VISUALIZE },
     {STR_INIT("coord_x"),    TI_FLOAT_ARR,   1,  {TI_COORDINATE_ARR},  _coordinate_x,    FLAG_DYNAMIC | FLAG_STATIC_VALIDATION | FLAG_QUERYABLE_LENGTH | FLAG_VISUALIZE },
@@ -6555,6 +6564,126 @@ static int _shape_weights(data_t* dst, data_t arg[], eval_context_t* ctx) {
     }
 
     return 0;
+}
+
+// Shape space of the whole system, shapespace()
+static int _shapespace_all(data_t* dst, data_t arg[], eval_context_t* ctx) {
+    ASSERT(ctx && ctx->sys);
+    (void)arg;
+
+    md_temp_scope_t temp = md_temp_begin_in(ctx->temp_alloc);
+    md_bitfield_t all = {0};
+    md_bitfield_init(&all, ctx->temp_alloc);
+    md_bitfield_set_range(&all, 0, ctx->sys->atom.count);
+    if (ctx->mol_ctx) {
+        md_bitfield_and_inplace(&all, ctx->mol_ctx);
+    }
+
+    data_t all_arg = {
+        .ptr  = &all,
+        .size = sizeof(md_bitfield_t),
+        .type = (type_info_t)TI_BITFIELD,
+    };
+    const int result = _shape_weights(dst, &all_arg, ctx);
+
+    md_temp_end(temp);
+    return result;
+}
+
+// The residues of the protein backbone with a defined phi and psi (the interior of each backbone range) that hold an
+// atom of the selection, as indices of segments. A null selection is every residue.
+static md_array(uint32_t) ramachandran_segments(data_t sel, eval_context_t* ctx) {
+    const md_system_t* sys = ctx->sys;
+    const md_protein_backbone_data_t* bb = &sys->protein_backbone;
+
+    md_bitfield_t mask = {0};
+    if (sel.ptr) {
+        md_bitfield_init(&mask, ctx->temp_alloc);
+        const md_bitfield_t* bf = as_bitfield(sel);
+        for (size_t i = 0; i < element_count(sel); ++i) {
+            md_bitfield_or_inplace(&mask, &bf[i]);
+        }
+    }
+    const bool has_mask = sel.ptr != NULL;
+
+    md_array(uint32_t) segments = 0;
+    for (size_t r = 0; r < bb->range.count; ++r) {
+        const uint32_t beg = bb->range.offset[r];
+        const uint32_t end = bb->range.offset[r + 1];
+        for (uint32_t i = beg + 1; i + 1 < end; ++i) {
+            const md_urange_t atoms = md_component_atom_range(&sys->component, bb->segment.comp_idx[i]);
+            if (ctx->mol_ctx && !md_bitfield_scan(ctx->mol_ctx, atoms.beg, atoms.end)) continue;
+            if (has_mask && !md_bitfield_scan(&mask, atoms.beg, atoms.end)) continue;
+            md_array_push(segments, i, ctx->temp_alloc);
+        }
+    }
+    return segments;
+}
+
+// sel is the selection (bitfield[]), or an empty data_t for every residue
+static int ramachandran_impl(data_t* dst, data_t sel, eval_context_t* ctx) {
+    ASSERT(ctx && ctx->sys);
+    const md_protein_backbone_data_t* bb = &ctx->sys->protein_backbone;
+
+    if (dst || ctx->vis) {
+        if (ctx->vis) {
+            if (sel.ptr) coordinate_visualize(sel, ctx);
+            return 0;
+        }
+
+        ASSERT(is_type_directly_compatible(dst->type, (type_info_t)TI_FLOAT2_ARR));
+        md_temp_scope_t temp = md_temp_begin_in(ctx->temp_alloc);
+
+        vec2_t* out = (vec2_t*)as_float_arr(*dst);
+        const size_t out_len = type_info_total_element_count(dst->type) / 2;
+        for (size_t i = 0; i < out_len; ++i) out[i] = (vec2_t){0};
+
+        // A selection which varies over frames can hold more residues than the length fixed at compile time
+        md_array(uint32_t) segments = ramachandran_segments(sel, ctx);
+        const md_backbone_angles_t* angles = md_util_state_backbone_angles(ctx->cur_state, ctx->sys);
+        if (!angles) {
+            md_backbone_angles_t* computed = (md_backbone_angles_t*)md_alloc(ctx->temp_alloc, sizeof(md_backbone_angles_t) * bb->segment.count);
+            md_util_backbone_angles_compute(computed, bb->segment.count, ctx->cur_state->xyz, &ctx->cur_state->unitcell, bb);
+            angles = computed;
+        }
+        for (size_t i = 0; i < MIN(md_array_size(segments), out_len); ++i) {
+            out[i] = (vec2_t){angles[segments[i]].phi, angles[segments[i]].psi};
+        }
+
+        md_temp_end(temp);
+        return 0;
+    }
+
+    // Query and validation. The length is the number of residues, which a selection that varies over frames changes.
+    if (bb->segment.count == 0) {
+        LOG_ERROR(ctx->ir, ctx->op_token, "ramachandran: the system has no protein backbone");
+        return STATIC_VALIDATION_ERROR;
+    }
+
+    md_temp_scope_t temp = md_temp_begin_in(ctx->temp_alloc);
+    md_array(uint32_t) segments = ramachandran_segments(sel, ctx);
+    const int count = (int)md_array_size(segments);
+    md_temp_end(temp);
+
+    if (ctx->backchannel) {
+        if (ctx->arg_flags && sel.ptr && (ctx->arg_flags[0] & FLAG_DYNAMIC_LENGTH)) {
+            ctx->backchannel->flags |= FLAG_DYNAMIC_LENGTH;
+        }
+        ctx->backchannel->unit[0] = md_unit_none();
+        ctx->backchannel->unit[1] = md_unit_radian();
+        ctx->backchannel->value_range = (frange_t){-PI, PI};
+    }
+    return count;
+}
+
+static int _ramachandran(data_t* dst, data_t arg[], eval_context_t* ctx) {
+    ASSERT(is_type_directly_compatible(arg[0].type, (type_info_t)TI_BITFIELD_ARR));
+    return ramachandran_impl(dst, arg[0], ctx);
+}
+
+static int _ramachandran_all(data_t* dst, data_t arg[], eval_context_t* ctx) {
+    (void)arg;
+    return ramachandran_impl(dst, (data_t){0}, ctx);
 }
 
 // Comparison of floats. A scalar is broadcast against an array, and two arrays of equal length are compared

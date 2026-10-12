@@ -1331,6 +1331,121 @@ UTEST_F(script, within_radius_over_trajectory) {
     md_arena_allocator_destroy(alloc);
 }
 
+// ramachandran() and shapespace() are properties with a vector per member, and their _weights forms hold the same
+// values with one array per component
+UTEST_F(script, ramachandran_and_shapespace) {
+    md_allocator_i* alloc = md_arena_allocator_create(utest_fixture->arena, MEGABYTES(4));
+    md_system_t* mol = &utest_fixture->ala;
+    const uint32_t num_frames = (uint32_t)script_frames(mol);
+    ASSERT_GT(num_frames, 0u);
+    ASSERT_GT(mol->protein_backbone.segment.count, (size_t)0);
+
+    md_script_ir_t* ir = md_script_ir_create(alloc);
+    str_t src = STR_INIT(
+        "rama = ramachandran(protein());\n"
+        "{phi, psi} = ramachandran_weights(protein());\n"
+        "all_rama = ramachandran();\n"
+        "sp = shapespace(resid(1:4));\n"
+        "{lin, plan, iso} = shapespace_weights(resid(1:4));\n"
+        "all_sp = shapespace();\n");
+    ASSERT_TRUE(md_script_ir_compile_from_source(ir, src, mol, NULL));
+    EXPECT_EQ(MD_SCRIPT_PROPERTY_FLAG_VECTOR, md_script_ir_property_flags(ir, STR_LIT("rama")));
+    EXPECT_EQ(MD_SCRIPT_PROPERTY_FLAG_VECTOR, md_script_ir_property_flags(ir, STR_LIT("sp")));
+    EXPECT_EQ(MD_SCRIPT_PROPERTY_FLAG_TEMPORAL, md_script_ir_property_flags(ir, STR_LIT("phi")));
+    EXPECT_EQ(MD_SCRIPT_PROPERTY_FLAG_TEMPORAL, md_script_ir_property_flags(ir, STR_LIT("lin")));
+
+    md_script_eval_t* eval = md_script_eval_create(num_frames, ir, alloc);
+    ASSERT_NE(NULL, eval);
+    ASSERT_TRUE(md_script_eval_frame_range(eval, ir, mol, SCRIPT_RUN, 0, num_frames));
+    const md_attributes_t* attributes = md_script_eval_attributes(eval);
+
+    const md_attribute_t* rama = md_attributes_find(attributes, STR_LIT("script/rama"));
+    const md_attribute_t* phi  = md_attributes_find(attributes, STR_LIT("script/phi"));
+    const md_attribute_t* psi  = md_attributes_find(attributes, STR_LIT("script/psi"));
+    const md_attribute_t* all_rama = md_attributes_find(attributes, STR_LIT("script/all_rama"));
+    ASSERT_TRUE(rama && phi && psi && all_rama);
+
+    // {frames, residues} with a (phi, psi) pair each
+    EXPECT_EQ(2u, rama->format.components);
+    EXPECT_EQ(2u, rama->format.rank);
+    EXPECT_EQ(num_frames, rama->format.shape[0]);
+    const uint32_t num_res = rama->format.shape[1];
+    EXPECT_GT(num_res, 0u);
+    EXPECT_EQ(num_res, phi->format.shape[1]);
+    EXPECT_EQ(num_res, psi->format.shape[1]);
+    EXPECT_EQ(num_res, all_rama->format.shape[1]);
+
+    const float* r  = (const float*)rama->data;
+    const float* ph = (const float*)phi->data;
+    const float* ps = (const float*)psi->data;
+    const float* ar = (const float*)all_rama->data;
+    for (uint32_t f = 0; f < num_frames; ++f) {
+        for (uint32_t i = 0; i < num_res; ++i) {
+            const size_t row = (size_t)f * num_res + i;
+            EXPECT_EQ(r[2 * row + 0], ph[row]);
+            EXPECT_EQ(r[2 * row + 1], ps[row]);
+            EXPECT_EQ(r[2 * row + 0], ar[2 * row + 0]);
+            EXPECT_EQ(r[2 * row + 1], ar[2 * row + 1]);
+            EXPECT_TRUE(fabsf(ph[row]) <= (float)PI + 1.0e-4f);
+            EXPECT_TRUE(fabsf(ps[row]) <= (float)PI + 1.0e-4f);
+        }
+    }
+
+    // One (linear, planar, isotropic) row per residue of the selection, which sum to one
+    const md_attribute_t* sp  = md_attributes_find(attributes, STR_LIT("script/sp"));
+    const md_attribute_t* lin = md_attributes_find(attributes, STR_LIT("script/lin"));
+    const md_attribute_t* plan = md_attributes_find(attributes, STR_LIT("script/plan"));
+    const md_attribute_t* iso = md_attributes_find(attributes, STR_LIT("script/iso"));
+    const md_attribute_t* all_sp = md_attributes_find(attributes, STR_LIT("script/all_sp"));
+    ASSERT_TRUE(sp && lin && plan && iso && all_sp);
+    EXPECT_EQ(3u, sp->format.components);
+    EXPECT_EQ(4u, sp->format.shape[1]);
+    EXPECT_EQ(4u, lin->format.shape[1]);
+    EXPECT_EQ(1u, all_sp->format.shape[1]);
+    const float* s3 = (const float*)sp->data;
+    for (uint32_t f = 0; f < num_frames; ++f) {
+        for (uint32_t i = 0; i < 4; ++i) {
+            const size_t row = (size_t)f * 4 + i;
+            EXPECT_EQ(s3[3 * row + 0], ((const float*)lin->data)[row]);
+            EXPECT_EQ(s3[3 * row + 1], ((const float*)plan->data)[row]);
+            EXPECT_EQ(s3[3 * row + 2], ((const float*)iso->data)[row]);
+            EXPECT_NEAR(1.0f, s3[3 * row + 0] + s3[3 * row + 1] + s3[3 * row + 2], 1.0e-4f);
+        }
+    }
+
+    md_script_eval_free(eval);
+
+    // A selection of the residues 2 to 3, which both have angles, gives one row each
+    md_script_ir_clear(ir);
+    ASSERT_TRUE(md_script_ir_compile_from_source(ir, STR_LIT("r = ramachandran(resid(2:3));"), mol, NULL));
+    eval = md_script_eval_create(num_frames, ir, alloc);
+    ASSERT_NE(NULL, eval);
+    const md_attribute_t* sub = md_attributes_find(md_script_eval_attributes(eval), STR_LIT("script/r"));
+    ASSERT_TRUE(sub != NULL);
+    EXPECT_EQ(2u, sub->format.shape[1]);
+    md_script_eval_free(eval);
+
+    // The same angle as a dihedral of the four atoms around it
+    md_script_ir_clear(ir);
+    ASSERT_TRUE(md_script_ir_compile_from_source(ir, STR_LIT(
+        "r = ramachandran(resid(2));\n"
+        "d = dihedral(name('C') in resid(1), name('N') in resid(2), name('CA') in resid(2), name('C') in resid(2));"), mol, NULL));
+    eval = md_script_eval_create(num_frames, ir, alloc);
+    ASSERT_NE(NULL, eval);
+    ASSERT_TRUE(md_script_eval_frame_range(eval, ir, mol, SCRIPT_RUN, 0, num_frames));
+    {
+        const md_attributes_t* attrs = md_script_eval_attributes(eval);
+        const float* rr = (const float*)md_attributes_find(attrs, STR_LIT("script/r"))->data;
+        const float* dd = (const float*)md_attributes_find(attrs, STR_LIT("script/d"))->data;
+        for (uint32_t f = 0; f < num_frames; ++f) {
+            EXPECT_NEAR(dd[f], rr[2 * f], 1.0e-3f);
+        }
+    }
+    md_script_eval_free(eval);
+
+    md_arena_allocator_destroy(alloc);
+}
+
 UTEST_F(script, dynamic_length) {
     md_allocator_i* alloc = md_arena_allocator_create(utest_fixture->arena, MEGABYTES(1));
     md_system_t* mol = &utest_fixture->ala;
@@ -2507,7 +2622,7 @@ UTEST(script, reference_documents_every_procedure) {
     ASSERT_FALSE(str_empty(doc));
 
     // Procedures that the parser handles itself rather than through the procedure table
-    static const str_t intrinsics[] = { STR_INIT("attr"), STR_INIT("flatten"), STR_INIT("transpose") };
+    static const str_t intrinsics[] = { STR_INIT("attr"), STR_INIT("flatten"), STR_INIT("transpose"), STR_INIT("ramachandran_weights"), STR_INIT("shapespace_weights") };
 
     str_t names[1024];  // documented names and aliases
     size_t num_names = 0;

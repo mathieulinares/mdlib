@@ -33,6 +33,7 @@ typedef enum md_script_property_flags_t {
     MD_SCRIPT_PROPERTY_FLAG_VOLUME          = 0x0004,
     MD_SCRIPT_PROPERTY_FLAG_PERIODIC        = 0x0008,
     MD_SCRIPT_PROPERTY_FLAG_SDF             = 0x0010,
+    MD_SCRIPT_PROPERTY_FLAG_VECTOR          = 0x0020, // float[N][2..4]: a vector per member, published with that many components, see md_script_eval_attributes
 } md_script_property_flags_t;
 
 
