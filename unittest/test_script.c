@@ -1451,6 +1451,28 @@ UTEST_F(script, ramachandran_and_shapespace) {
     }
     md_script_eval_free(eval);
 
+    // The atoms a property was made of are what its visualization marks: every atom without an argument, the
+    // residues of the selection with one
+    {
+        md_script_ir_clear(ir);
+        ASSERT_TRUE(md_script_ir_compile_from_source(ir, STR_LIT("a = ramachandran(); b = ramachandran(resid(2:3));"), mol, NULL));
+        md_script_vis_t vis = {0};
+        md_script_vis_init(&vis, alloc);
+        const md_script_vis_ctx_t vis_ctx = { .ir = ir, .sys = mol, .state = &mol->reference };
+
+        const md_script_vis_payload_o* pa = md_script_ir_property_vis_payload(ir, STR_LIT("a"));
+        ASSERT_TRUE(pa != NULL);
+        EXPECT_TRUE(md_script_vis_eval_payload(&vis, pa, -1, &vis_ctx, MD_SCRIPT_VISUALIZE_ATOMS));
+        EXPECT_EQ(mol->atom.count, md_bitfield_popcount(&vis.atom_mask));
+
+        md_script_vis_clear(&vis);
+        const md_script_vis_payload_o* pb = md_script_ir_property_vis_payload(ir, STR_LIT("b"));
+        ASSERT_TRUE(pb != NULL);
+        EXPECT_TRUE(md_script_vis_eval_payload(&vis, pb, -1, &vis_ctx, MD_SCRIPT_VISUALIZE_ATOMS));
+        const size_t expected = md_component_atom_count(&mol->component, 1) + md_component_atom_count(&mol->component, 2);
+        EXPECT_EQ(expected, md_bitfield_popcount(&vis.atom_mask));
+    }
+
     md_arena_allocator_destroy(alloc);
 }
 

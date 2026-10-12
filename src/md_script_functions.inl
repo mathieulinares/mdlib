@@ -785,10 +785,10 @@ static procedure_t procedures[] = {
     {STR_INIT("shape_weights"), TI_FLOAT3_ARR,  1,  {TI_COORDINATE_ARR},  _shape_weights, FLAG_DYNAMIC | FLAG_STATIC_VALIDATION | FLAG_QUERYABLE_LENGTH | FLAG_VISUALIZE},
     // One (linear, planar, isotropic) row per group. shapespace_weights() is the same transposed, see the parser
     {STR_INIT("shapespace"),    TI_FLOAT3_ARR,  1,  {TI_COORDINATE_ARR},  _shape_weights, FLAG_DYNAMIC | FLAG_STATIC_VALIDATION | FLAG_QUERYABLE_LENGTH | FLAG_VISUALIZE},
-    {STR_INIT("shapespace"),    TI_FLOAT3_ARR,  0,  {0},                  _shapespace_all, FLAG_DYNAMIC | FLAG_STATIC_VALIDATION | FLAG_QUERYABLE_LENGTH},
+    {STR_INIT("shapespace"),    TI_FLOAT3_ARR,  0,  {0},                  _shapespace_all, FLAG_DYNAMIC | FLAG_STATIC_VALIDATION | FLAG_QUERYABLE_LENGTH | FLAG_VISUALIZE},
     // One (phi, psi) row per residue of the protein backbone that the selection touches. ramachandran_weights() is the same transposed, see the parser
     {STR_INIT("ramachandran"),  TI_FLOAT2_ARR,  1,  {TI_BITFIELD_ARR},    _ramachandran,   FLAG_DYNAMIC | FLAG_STATIC_VALIDATION | FLAG_QUERYABLE_LENGTH | FLAG_VISUALIZE},
-    {STR_INIT("ramachandran"),  TI_FLOAT2_ARR,  0,  {0},                  _ramachandran_all, FLAG_DYNAMIC | FLAG_STATIC_VALIDATION | FLAG_QUERYABLE_LENGTH},
+    {STR_INIT("ramachandran"),  TI_FLOAT2_ARR,  0,  {0},                  _ramachandran_all, FLAG_DYNAMIC | FLAG_STATIC_VALIDATION | FLAG_QUERYABLE_LENGTH | FLAG_VISUALIZE},
 
     {STR_INIT("coord"),      TI_FLOAT3_ARR,  1,  {TI_COORDINATE_ARR},  _coordinate,      FLAG_DYNAMIC | FLAG_STATIC_VALIDATION | FLAG_QUERYABLE_LENGTH | FLAG_VISUALIZE },
     {STR_INIT("coord_x"),    TI_FLOAT_ARR,   1,  {TI_COORDINATE_ARR},  _coordinate_x,    FLAG_DYNAMIC | FLAG_STATIC_VALIDATION | FLAG_QUERYABLE_LENGTH | FLAG_VISUALIZE },
@@ -6627,7 +6627,18 @@ static int ramachandran_impl(data_t* dst, data_t sel, eval_context_t* ctx) {
 
     if (dst || ctx->vis) {
         if (ctx->vis) {
-            if (sel.ptr) coordinate_visualize(sel, ctx);
+            if (sel.ptr) {
+                coordinate_visualize(sel, ctx);
+            } else {
+                // Every residue: the atoms of the system
+                md_temp_scope_t temp = md_temp_begin_in(ctx->temp_alloc);
+                md_bitfield_t all = {0};
+                md_bitfield_init(&all, ctx->temp_alloc);
+                md_bitfield_set_range(&all, 0, ctx->sys->atom.count);
+                data_t all_arg = { .ptr = &all, .size = sizeof(md_bitfield_t), .type = (type_info_t)TI_BITFIELD };
+                coordinate_visualize(all_arg, ctx);
+                md_temp_end(temp);
+            }
             return 0;
         }
 
