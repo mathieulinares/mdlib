@@ -2981,6 +2981,21 @@ static bool evaluate_transpose(data_t* dst, const ast_node_t* node, eval_context
     const ast_node_t* arg = node->children[0];
     int ndim = dim_ndims(arg->data.type.dim);
 
+    if (dst && ndim == 2 && (arg->data.type.dim[0] == 1 || arg->data.type.dim[1] == 1)) {
+        // A row or a column: transposed it holds the same values in the same order, and a destination with
+        // its trailing one pruned ([3][1] as [3]) must not be told apart from it
+        data_t data = arg->data;
+        data.ptr = 0;
+        data.size = 0;
+        allocate_data(&data, data.type, ctx->temp_alloc);
+        if (!evaluate_node(&data, arg, ctx) || data.size != dst->size) {
+            LOG_ERROR(ctx->ir, node->token, "Failed to evaluate subexpression in transpose operation");
+            return false;
+        }
+        MEMCPY(dst->ptr, data.ptr, data.size);
+        return true;
+    }
+
     if (dst && ndim == 2) {
         if (ndim != dim_ndims(dst->type.dim)) {
             LOG_ERROR(ctx->ir, node->token, "Incorrect dimensions in transpose operation");

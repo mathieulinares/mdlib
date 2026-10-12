@@ -1415,6 +1415,14 @@ UTEST_F(script, ramachandran_and_shapespace) {
 
     md_script_eval_free(eval);
 
+    // A single group is transposed into three arrays of one value, as in the default script
+    md_script_ir_clear(ir);
+    ASSERT_TRUE(md_script_ir_compile_from_source(ir, STR_LIT("{lin, plan, iso} = shapespace_weights(all);"), mol, NULL));
+    eval = md_script_eval_create(num_frames, ir, alloc);
+    ASSERT_NE(NULL, eval);
+    EXPECT_TRUE(md_script_eval_frame_range(eval, ir, mol, SCRIPT_RUN, 0, num_frames));
+    md_script_eval_free(eval);
+
     // A selection of the residues 2 to 3, which both have angles, gives one row each
     md_script_ir_clear(ir);
     ASSERT_TRUE(md_script_ir_compile_from_source(ir, STR_LIT("r = ramachandran(resid(2:3));"), mol, NULL));
