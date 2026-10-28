@@ -2281,7 +2281,7 @@ typedef struct cpg_worker_t {
     const cpg_ctx_t* ctx;
     cpg_scratch_t sc;
     int tid, nthreads;
-    int job;                            // 0: cube sweep, 1: separatrices, 2: polish
+    int job;                            // 0: cube sweep, 1: separatrices, 2: polish, 3: ring surfaces
     volatile int32_t* cancel;
     cpg_progress_t* prog;               // worker 0 only: reports (prog_base + its position) / prog_total
     double prog_base, prog_total;
@@ -2305,6 +2305,9 @@ typedef struct cpg_worker_t {
     // polish
     const cpg_box_t* pboxes;
     cpg_polish_t* pres;
+    // ring surfaces: item t leaves rs_x[t] along rs_dir[t] (md_topo_gto_ring_surface_maxima)
+    const double (*rs_x)[3];
+    const double (*rs_dir)[3];
 } cpg_worker_t;
 
 // The root of a cube Krawczyk certified (unique in the 1.5x inflated cube): double Newton from the cube
@@ -2435,11 +2438,16 @@ static void cpg_worker_entry(void* data) {
             if (ne > w->sep_max_evals) w->sep_max_evals = (uint32_t)MIN(ne, UINT32_MAX);
             if (w->ends[2 * i + e] < 0) w->sep_open++;
         }
-    } else {
+    } else if (w->job == 2) {
         for (int t; (t = cpg_queue_pop(w->queue)) >= 0; ) {
             if (w->cancel && *w->cancel) return;
             cpg_progress_set(w->prog, (w->prog_base + (double)t) / w->prog_total);
             w->pres[t].r = cpg_polish_root(w->ctx, &w->sc, &w->pboxes[t], &w->pres[t].cp);
+        }
+    } else {
+        for (int t; (t = cpg_queue_pop(w->queue)) >= 0; ) {
+            if (w->cancel && *w->cancel) return;
+            w->ends[t] = cpg_trace(w->ctx, &w->sc, w->rs_x[t], w->rs_dir[t], 1.0, w->cps, w->ncp, MD_TOPO_MAXIMUM, w->sep_rho_hi);
         }
     }
 }
@@ -3232,6 +3240,175 @@ bool md_topo_compute_extremum_graph_gto(md_topo_extremum_graph_t* out_graph, md_
     const bool res = cpg_run_finish(&R, out_graph, out_info);
     cpg_run_free(&R);
     return res;
+}
+
+typedef struct cpg_rs_sample_t {
+    double angle;
+    int    end;     // index into the maxima, -1 when the path reached none
+} cpg_rs_sample_t;
+
+static int cpg_rs_sample_cmp(const void* a, const void* b) {
+    const double x = ((const cpg_rs_sample_t*)a)->angle, y = ((const cpg_rs_sample_t*)b)->angle;
+    return (x > y) - (x < y);
+}
+
+bool md_topo_gto_ring_surface_maxima(uint32_t* out_maxima, uint32_t* out_count, uint32_t capacity, const md_topo_gto_desc_t* desc,
+                                     const md_topo_extremum_graph_t* graph, const uint32_t* rcps, size_t num_rcps) {
+    ASSERT(out_maxima);
+    ASSERT(out_count);
+    ASSERT(desc);
+    ASSERT(graph);
+    for (size_t k = 0; k < num_rcps; ++k) {
+        out_count[k] = 0;
+        for (uint32_t j = 0; j < capacity; ++j) out_maxima[k * capacity + j] = UINT32_MAX;
+    }
+    if (!cpg_check_desc(desc, "md_topo_gto_ring_surface_maxima")) return false;
+    if (!graph->vertices_f64) {
+        MD_LOG_ERROR("md_topo_gto_ring_surface_maxima: the graph has no Hessians (it is not from md_topo_compute_extremum_graph_gto*)");
+        return false;
+    }
+    if (num_rcps == 0) return true;
+    for (size_t k = 0; k < num_rcps; ++k) {
+        if (rcps[k] >= graph->num_vertices || graph->types[rcps[k]] != MD_TOPO_JOIN_SADDLE) {
+            MD_LOG_ERROR("md_topo_gto_ring_surface_maxima: vertex %u is not a ring critical point", rcps[k]);
+            return false;
+        }
+    }
+    md_allocator_i* heap = md_get_heap_allocator();
+
+    // the maxima the paths may end in, and their graph indices
+    int ncp = 0;
+    for (uint32_t i = 0; i < graph->num_vertices; ++i) ncp += graph->types[i] == MD_TOPO_MAXIMUM;
+    cpg_cp_t* cps = (cpg_cp_t*)md_alloc(heap, sizeof(cpg_cp_t) * MAX(ncp, 1));
+    uint32_t* vertex = (uint32_t*)md_alloc(heap, sizeof(uint32_t) * MAX(ncp, 1));
+    double rho_hi = -DBL_MAX;
+    ncp = 0;
+    for (uint32_t i = 0; i < graph->num_vertices; ++i) {
+        if (graph->types[i] != MD_TOPO_MAXIMUM) continue;
+        const md_topo_vert_f64_t* v = &graph->vertices_f64[i];
+        MEMSET(&cps[ncp], 0, sizeof(cpg_cp_t));
+        cps[ncp].x[0] = v->x; cps[ncp].x[1] = v->y; cps[ncp].x[2] = v->z;
+        cps[ncp].rho = v->value;
+        cps[ncp].type = MD_TOPO_MAXIMUM;
+        rho_hi = fmax(rho_hi, v->value);
+        vertex[ncp++] = i;
+    }
+
+    // The paths leave the ring CP in the plane of its two positive curvatures, at an angle from the first. Almost
+    // all of them follow the steeper curvature to the two nuclei it points at; the angles leading to the other
+    // nuclei of the ring can be very narrow. So: a coarse sweep, then bisection wherever two neighbouring angles
+    // end in different maxima, down to an angle far below what separates the sectors of a ring.
+    const int    num_sweep   = 24;
+    const int    max_rounds  = 60;
+    const size_t max_samples = 4096;    // per ring CP
+    const double min_width   = 1e-12;
+    const double two_pi      = 2.0 * 3.14159265358979323846;
+
+    cpg_rs_sample_t** samples = (cpg_rs_sample_t**)md_alloc(heap, sizeof(cpg_rs_sample_t*) * num_rcps);
+    MEMSET(samples, 0, sizeof(cpg_rs_sample_t*) * num_rcps);
+    double (*xs)[3] = NULL;
+    double (*dirs)[3] = NULL;
+    int* ends = NULL;
+    uint32_t* owner = NULL;
+    double* angles = NULL;
+
+    md_topo_gto_desc_t d = *desc;
+    d.progress = NULL;
+    cpg_run_t R;
+    cpg_run_init(&R, &d);
+    bool ok = R.ok;
+    for (int round = 0; ok && round < max_rounds; ++round) {
+        md_array_shrink(owner, 0);
+        md_array_shrink(angles, 0);
+        for (size_t k = 0; k < num_rcps; ++k) {
+            if (round == 0) {
+                for (int i = 0; i < num_sweep; ++i) {
+                    md_array_push(owner, (uint32_t)k, heap);
+                    md_array_push(angles, two_pi * i / num_sweep, heap);
+                }
+                continue;
+            }
+            const cpg_rs_sample_t* S = samples[k];
+            const size_t n = md_array_size(S);
+            if (n < 2 || n >= max_samples) continue;
+            for (size_t i = 0; i < n; ++i) {
+                const cpg_rs_sample_t* p = &S[i];
+                const cpg_rs_sample_t* q = &S[(i + 1) % n];
+                const double b = i + 1 < n ? q->angle : q->angle + two_pi;
+                if (p->end == q->end || b - p->angle <= min_width) continue;
+                md_array_push(owner, (uint32_t)k, heap);
+                md_array_push(angles, fmod(0.5 * (p->angle + b), two_pi), heap);
+            }
+        }
+        const size_t total = md_array_size(owner);
+        if (total == 0) break;
+        md_array_resize(xs, total, heap);
+        md_array_resize(dirs, total, heap);
+        md_array_resize(ends, total, heap);
+        for (size_t t = 0; t < total; ++t) {
+            const md_topo_vert_f64_t* v = &graph->vertices_f64[rcps[owner[t]]];
+            const double* u = v->hessian_eigenvectors[1];
+            const double* w = v->hessian_eigenvectors[2];
+            xs[t][0] = v->x; xs[t][1] = v->y; xs[t][2] = v->z;
+            for (int c = 0; c < 3; ++c) dirs[t][c] = cos(angles[t]) * u[c] + sin(angles[t]) * w[c];
+            ends[t] = -1;
+        }
+        cpg_queue_t queue = { .next = 0, .count = (int)total };
+        md_mutex_init(&queue.mutex);
+        for (int t = 0; t < R.nthreads; ++t) {
+            cpg_worker_t* wk = &R.workers[t];
+            wk->job = 3;
+            wk->queue = &queue;
+            wk->cps = cps;
+            wk->ncp = ncp;
+            wk->ends = ends;
+            wk->rs_x = (const double(*)[3])xs;
+            wk->rs_dir = (const double(*)[3])dirs;
+            wk->sep_rho_hi = rho_hi * (1.0 + 1e-6);
+        }
+        cpg_run_workers(R.workers, (int)MIN((size_t)R.nthreads, total));
+        md_mutex_destroy(&queue.mutex);
+        if (desc->cancel && *desc->cancel) { ok = false; break; }
+        for (size_t t = 0; t < total; ++t) {
+            const cpg_rs_sample_t smp = { angles[t], ends[t] };
+            md_array_push(samples[owner[t]], smp, heap);
+        }
+        for (size_t k = 0; k < num_rcps; ++k) {
+            if (md_array_size(samples[k]) > 1) qsort(samples[k], md_array_size(samples[k]), sizeof(cpg_rs_sample_t), cpg_rs_sample_cmp);
+        }
+    }
+
+    // the maxima in angular order, each run of paths ending in the same one counted once
+    for (size_t k = 0; ok && k < num_rcps; ++k) {
+        const cpg_rs_sample_t* S = samples[k];
+        const size_t n = md_array_size(S);
+        int first = -1, last = -1;
+        uint32_t count = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (S[i].end < 0 || S[i].end == last) continue;
+            if (first < 0) first = S[i].end;
+            last = S[i].end;
+            if (count < capacity) out_maxima[k * capacity + count] = vertex[S[i].end];
+            count++;
+        }
+        if (count > 1 && first == last) {   // the run that wraps around
+            count--;
+            if (count < capacity) out_maxima[k * capacity + count] = UINT32_MAX;
+        }
+        out_count[k] = count;
+    }
+
+    cpg_run_free(&R);
+    for (size_t k = 0; k < num_rcps; ++k) md_array_free(samples[k], heap);
+    md_free(heap, samples, sizeof(cpg_rs_sample_t*) * num_rcps);
+    md_array_free(xs, heap);
+    md_array_free(dirs, heap);
+    md_array_free(ends, heap);
+    md_array_free(owner, heap);
+    md_array_free(angles, heap);
+    md_free(heap, vertex, sizeof(uint32_t) * MAX(ncp, 1));
+    md_free(heap, cps, sizeof(cpg_cp_t) * MAX(ncp, 1));
+    return ok;
 }
 
 #if MD_ENABLE_GPU

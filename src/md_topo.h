@@ -231,6 +231,17 @@ typedef struct md_topo_gto_info_t {
 
 bool md_topo_compute_extremum_graph_gto(md_topo_extremum_graph_t* out_graph, md_topo_gto_info_t* out_info, const md_topo_gto_desc_t* desc);
 
+// The ring surface of each listed ring critical point (MD_TOPO_JOIN_SADDLE) of graph, a graph that
+// md_topo_compute_extremum_graph_gto* found for desc: the steepest-ascent paths leaving it in the plane of its two
+// positive curvatures, followed (on the CPU, in double) to the maxima they end in. Those are the nuclei of the ring,
+// what a ring CP's ring is from the density rather than from the geometry. The angles leading to some of them can be
+// very narrow, so the paths are refined by bisection wherever neighbouring ones end in different maxima.
+// out_maxima[k * capacity + j], j < out_count[k], are the graph indices of the maxima the ring surface of rcps[k]
+// reaches, in order around it; out_count[k] may exceed capacity, the rest is then not stored.
+// desc->cancel is honoured; desc->progress is not. False on invalid input or when cancelled.
+bool md_topo_gto_ring_surface_maxima(uint32_t* out_maxima, uint32_t* out_count, uint32_t capacity, const md_topo_gto_desc_t* desc,
+                                     const md_topo_extremum_graph_t* graph, const uint32_t* rcps, size_t num_rcps);
+
 #if MD_ENABLE_GPU
 // The same search with the octree sweep on the GPU, in fp32 with rigorous rounding margins (every bound
 // the tests use carries the rounding error of its own computation), so the guarantee is unchanged. The
