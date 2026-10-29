@@ -9,6 +9,7 @@
 #include <core/md_str.h>
 
 #include <math.h>
+#include <stdatomic.h>
 #include <string.h>
 
 // Certified critical points of a GTO density (md_topo_compute_extremum_graph_gto), driven exactly the way
@@ -150,6 +151,310 @@ UTEST(topo_gto, water_topology_is_certified) {
 
 // Same input, same output, bit for bit, whatever the thread count: cubes are decided independently and
 // their results merged in cube order, with no atomics and no ordering that depends on scheduling.
+// The kinetic energy density at points: at the water BCPs rho agrees with the search's and the local virial theorem
+// gives an O-H bond's shared-shell signature (H < 0, |V|/G > 1). For a density of one orbital, D = c c^T, G is the
+// von Weizsaecker 1/8 |grad rho|^2 / rho exactly, here with grad rho from central differences of rho.
+UTEST(topo_gto, kinetic_energy_density) {
+    topo_gto_input_t in;
+    ASSERT_TRUE(topo_gto_load_water(&in));
+    md_topo_gto_desc_t desc = topo_gto_desc(&in);
+    md_topo_extremum_graph_t graph = { .alloc = in.t.alloc };
+    md_topo_gto_info_t info;
+    ASSERT_TRUE(md_topo_compute_extremum_graph_gto(&graph, &info, &desc));
+    ASSERT_TRUE(graph.vertices_f64 != NULL);
+    int bcps = 0;
+    for (uint32_t i = 0; i < graph.num_vertices; ++i) {
+        if (graph.types[i] != MD_TOPO_SPLIT_SADDLE) continue;
+        const md_topo_vert_f64_t* v = &graph.vertices_f64[i];
+        const double x[3] = { v->x, v->y, v->z };
+        double G = 0.0, rho = 0.0;
+        ASSERT_TRUE(md_topo_gto_kinetic_energy_density(&G, &rho, x, 1, &desc));
+        EXPECT_NEAR(v->value, rho, 1e-10 * v->value);
+        const double lap = v->hessian_eigenvalues[0] + v->hessian_eigenvalues[1] + v->hessian_eigenvalues[2];
+        const double V = 0.25 * lap - 2.0 * G;
+        EXPECT_GT(G, 0.0);
+        EXPECT_LT(G + V, 0.0);
+        EXPECT_GT(-V / G, 1.0);
+        ++bcps;
+    }
+    EXPECT_EQ(2, bcps);
+
+    const size_t n = md_gto_basis_num_ao(&in.basis);
+    double* c = (double*)md_alloc(in.t.alloc, sizeof(double) * n);
+    double* D = (double*)md_alloc(in.t.alloc, sizeof(double) * n * n);
+    for (size_t i = 0; i < n; ++i) c[i] = 0.3 * sin(1.7 * (double)i + 0.4);
+    for (size_t i = 0; i < n; ++i) for (size_t j = 0; j < n; ++j) D[i * n + j] = c[i] * c[j];
+    desc.density_matrix = D;
+    const double h = 1e-4;
+    const double p0[3][3] = { {0.3, -0.2, 0.5}, {1.1, 0.4, -0.3}, {-0.6, 0.9, 0.2} };
+    for (int k = 0; k < 3; ++k) {
+        double pts[7][3];
+        for (int t = 0; t < 7; ++t) for (int a = 0; a < 3; ++a) pts[t][a] = p0[k][a] + in.xyz[a];
+        for (int a = 0; a < 3; ++a) { pts[1 + 2 * a][a] += h; pts[2 + 2 * a][a] -= h; }
+        double G[7], rho[7];
+        ASSERT_TRUE(md_topo_gto_kinetic_energy_density(G, rho, &pts[0][0], 7, &desc));
+        double g2 = 0.0;
+        for (int a = 0; a < 3; ++a) {
+            const double d = (rho[1 + 2 * a] - rho[2 + 2 * a]) / (2.0 * h);
+            g2 += d * d;
+        }
+        ASSERT_GT(rho[0], 1e-6);
+        EXPECT_NEAR(g2 / (8.0 * rho[0]), G[0], 1e-6 * fmax(G[0], 1e-3));
+    }
+    md_free(in.t.alloc, D, sizeof(double) * n * n);
+    md_free(in.t.alloc, c, sizeof(double) * n);
+    md_topo_extremum_graph_free(&graph);
+    qm_test_free(&in.t);
+}
+
+UTEST(topo_gto, density_derivatives) {
+    topo_gto_input_t in;
+    ASSERT_TRUE(topo_gto_load_water(&in));
+    md_topo_gto_desc_t desc = topo_gto_desc(&in);
+    md_topo_extremum_graph_t graph = { .alloc = in.t.alloc };
+    md_topo_gto_info_t info;
+    ASSERT_TRUE(md_topo_compute_extremum_graph_gto(&graph, &info, &desc));
+    ASSERT_TRUE(graph.vertices_f64 != NULL);
+    // At the critical points: rho as found, no gradient, and the Hessian's trace is the Laplacian
+    for (uint32_t i = 0; i < graph.num_vertices; ++i) {
+        const md_topo_vert_f64_t* v = &graph.vertices_f64[i];
+        const double x[3] = { v->x, v->y, v->z };
+        double rho, g[3], h[6];
+        ASSERT_TRUE(md_topo_gto_density_derivatives(&rho, g, h, x, 1, &desc));
+        EXPECT_NEAR(v->value, rho, 1e-10 * v->value);
+        const double lap = v->hessian_eigenvalues[0] + v->hessian_eigenvalues[1] + v->hessian_eigenvalues[2];
+        EXPECT_NEAR(lap, h[0] + h[3] + h[5], 1e-6 * fabs(lap) + 1e-9);
+        EXPECT_LT(sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]), 1e-6 * fmax(rho, 1.0));
+    }
+    // Elsewhere: the gradient and Hessian are the finite differences of rho and the gradient
+    const double step = 1e-4;
+    const double p0[3][3] = { {0.3, -0.2, 0.5}, {1.1, 0.4, -0.3}, {-0.6, 0.9, 1.2} };
+    static const int sym[3][3] = { {0, 1, 2}, {1, 3, 4}, {2, 4, 5} };
+    for (int k = 0; k < 3; ++k) {
+        double pts[7][3];
+        for (int t = 0; t < 7; ++t) for (int a = 0; a < 3; ++a) pts[t][a] = p0[k][a] + in.xyz[a];
+        for (int a = 0; a < 3; ++a) { pts[1 + 2 * a][a] += step; pts[2 + 2 * a][a] -= step; }
+        double rho[7], g[7][3], h[7][6];
+        ASSERT_TRUE(md_topo_gto_density_derivatives(rho, &g[0][0], &h[0][0], &pts[0][0], 7, &desc));
+        for (int a = 0; a < 3; ++a) {
+            const double fd = (rho[1 + 2 * a] - rho[2 + 2 * a]) / (2.0 * step);
+            EXPECT_NEAR(fd, g[0][a], 1e-6 * fmax(fabs(g[0][a]), 1e-2));
+            for (int b = 0; b < 3; ++b) {
+                const double fdh = (g[1 + 2 * a][b] - g[2 + 2 * a][b]) / (2.0 * step);
+                EXPECT_NEAR(fdh, h[0][sym[a][b]], 1e-5 * fmax(fabs(h[0][sym[a][b]]), 1e-1));
+            }
+        }
+    }
+    // Only rho
+    const double x[3] = { in.xyz[0] + 0.5, in.xyz[1], in.xyz[2] };
+    double r0 = 0.0, r1 = 0.0;
+    ASSERT_TRUE(md_topo_gto_density_derivatives(&r0, NULL, NULL, x, 1, &desc));
+    ASSERT_TRUE(md_topo_gto_density_derivatives(&r1, NULL, NULL, x, 1, &desc));
+    EXPECT_GT(r0, 0.0);
+    EXPECT_EQ(r0, r1);
+    md_topo_extremum_graph_free(&graph);
+    qm_test_free(&in.t);
+}
+
+typedef struct topo_pauli_input_t {
+    md_gto_shell_t shells[2];
+    float alpha[2], coeff[2], xyz[6];
+    double density[4];
+    md_gto_basis_t basis;
+    md_topo_gto_desc_t desc;
+} topo_pauli_input_t;
+
+static void topo_pauli_init(topo_pauli_input_t* in) {
+    memset(in, 0, sizeof(*in));
+    in->shells[0] = (md_gto_shell_t){ .atom_idx = 0, .primitive_offset = 0, .num_primitives = 1 };
+    in->shells[1] = (md_gto_shell_t){ .atom_idx = 1, .primitive_offset = 1, .num_primitives = 1 };
+    in->alpha[0] = in->alpha[1] = 0.5f;
+    in->coeff[0] = in->coeff[1] = 1.0f;
+    in->xyz[0] = -1.0f;
+    in->xyz[3] = 1.0f;
+    in->density[0] = in->density[3] = 1.0;
+    in->basis = (md_gto_basis_t){
+        .num_shells = 2, .num_primitives = 2, .shells = in->shells, .alpha = in->alpha, .coeff = in->coeff,
+    };
+    in->desc = (md_topo_gto_desc_t){
+        .basis = &in->basis, .atom_xyz = in->xyz, .density_matrix = in->density, .num_threads = 1,
+    };
+}
+
+static void topo_pauli_gaussians(const double x[3], double phi[2], double grad[2][3]) {
+    for (int i = 0; i < 2; ++i) {
+        const double r[3] = { x[0] - (i ? 1.0 : -1.0), x[1], x[2] };
+        phi[i] = exp(-0.5 * (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]));
+        for (int a = 0; a < 3; ++a) grad[i][a] = -r[a] * phi[i];
+    }
+}
+
+UTEST(topo_gto, pauli_rank_one_gaussians) {
+    topo_pauli_input_t in;
+    topo_pauli_init(&in);
+    const double c[2] = {0.8, 0.4};
+    for (int i = 0; i < 2; ++i) for (int j = 0; j < 2; ++j) in.density[2 * i + j] = c[i] * c[j];
+    const double xyz[4][3] = {{0, 0, 0}, {0.4, 0.2, -0.3}, {-0.7, -0.5, 0.1}, {1.3, 0.1, 0.2}};
+    double P[4], G[4], rho[4], grad[4][3], old_G[4], old_rho[4];
+    ASSERT_TRUE(md_topo_gto_pauli_kinetic_energy_density(P, G, rho, &grad[0][0], &xyz[0][0], 4, &in.desc));
+    ASSERT_TRUE(md_topo_gto_kinetic_energy_density(old_G, old_rho, &xyz[0][0], 4, &in.desc));
+    for (int t = 0; t < 4; ++t) {
+        double phi[2], dphi[2][3];
+        topo_pauli_gaussians(xyz[t], phi, dphi);
+        const double psi = c[0] * phi[0] + c[1] * phi[1];
+        double tau = 0.0;
+        EXPECT_NEAR(psi * psi, rho[t], 1e-14);
+        for (int a = 0; a < 3; ++a) {
+            const double dpsi = c[0] * dphi[0][a] + c[1] * dphi[1][a];
+            tau += 0.5 * dpsi * dpsi;
+            EXPECT_NEAR(2.0 * psi * dpsi, grad[t][a], 1e-14);
+        }
+        EXPECT_NEAR(tau, G[t], 1e-14);
+        EXPECT_NEAR(0.0, P[t], 1e-14);
+        EXPECT_EQ(old_G[t], G[t]);
+        EXPECT_EQ(old_rho[t], rho[t]);
+    }
+}
+
+UTEST(topo_gto, pauli_two_orbital_gaussians) {
+    topo_pauli_input_t in;
+    topo_pauli_init(&in);
+    const double xyz[4][3] = {{0, 0, 0}, {0.4, 0.2, -0.3}, {-0.7, -0.5, 0.1}, {1.3, 0.1, 0.2}};
+    double P[4], G[4], rho[4], grad[4][3], ref_rho[4], ref_grad[4][3], only_P[4];
+    ASSERT_TRUE(md_topo_gto_pauli_kinetic_energy_density(P, G, rho, &grad[0][0], &xyz[0][0], 4, &in.desc));
+    ASSERT_TRUE(md_topo_gto_density_derivatives(ref_rho, &ref_grad[0][0], NULL, &xyz[0][0], 4, &in.desc));
+    ASSERT_TRUE(md_topo_gto_pauli_kinetic_energy_density(only_P, NULL, NULL, NULL, &xyz[0][0], 4, &in.desc));
+    for (int t = 0; t < 4; ++t) {
+        double phi[2], dphi[2][3];
+        topo_pauli_gaussians(xyz[t], phi, dphi);
+        const double a = phi[0] * phi[0], b = phi[1] * phi[1];
+        // For two independently occupied real orbitals: t_P = ab |grad ln phi0 - grad ln phi1|^2 / (2(a+b)).
+        EXPECT_NEAR(2.0 * a * b / (a + b), P[t], 1e-14);
+        EXPECT_GT(P[t], 0.0);
+        EXPECT_EQ(P[t], only_P[t]);
+        EXPECT_EQ(rho[t], ref_rho[t]);
+        double tau = 0.0;
+        for (int k = 0; k < 3; ++k) {
+            tau += 0.5 * (dphi[0][k] * dphi[0][k] + dphi[1][k] * dphi[1][k]);
+            EXPECT_EQ(grad[t][k], ref_grad[t][k]);
+            double xp[3] = {xyz[t][0], xyz[t][1], xyz[t][2]};
+            double xm[3] = {xyz[t][0], xyz[t][1], xyz[t][2]};
+            const double h = 1e-5;
+            xp[k] += h;
+            xm[k] -= h;
+            double rp, rm;
+            ASSERT_TRUE(md_topo_gto_density_derivatives(&rp, NULL, NULL, xp, 1, &in.desc));
+            ASSERT_TRUE(md_topo_gto_density_derivatives(&rm, NULL, NULL, xm, 1, &in.desc));
+            EXPECT_NEAR((rp - rm) / (2.0 * h), grad[t][k], 1e-9);
+        }
+        EXPECT_NEAR(tau, G[t], 1e-14);
+    }
+    for (int a = 0; a < 3; ++a) EXPECT_NEAR(0.0, grad[0][a], 1e-14);
+    EXPECT_EQ(G[0], P[0]);
+    EXPECT_GT(G[0], 0.0);
+}
+
+UTEST(topo_gto, pauli_threads_cancel_and_vacuum) {
+    topo_pauli_input_t in;
+    topo_pauli_init(&in);
+    enum { N = 257 };
+    double xyz[N][3], P[2][N], G[2][N], rho[2][N], grad[2][N][3];
+    for (int t = 0; t < N; ++t) {
+        xyz[t][0] = -2.0 + 4.0 * t / (N - 1);
+        xyz[t][1] = 0.2;
+        xyz[t][2] = -0.1;
+    }
+    for (int i = 0; i < 2; ++i) {
+        in.desc.num_threads = i ? 4 : 1;
+        ASSERT_TRUE(md_topo_gto_pauli_kinetic_energy_density(P[i], G[i], rho[i], &grad[i][0][0], &xyz[0][0], N, &in.desc));
+    }
+    EXPECT_EQ(0, memcmp(P[0], P[1], sizeof(P[0])));
+    EXPECT_EQ(0, memcmp(G[0], G[1], sizeof(G[0])));
+    EXPECT_EQ(0, memcmp(rho[0], rho[1], sizeof(rho[0])));
+    EXPECT_EQ(0, memcmp(grad[0], grad[1], sizeof(grad[0])));
+    const double vacuum[3] = {1e6, 0, 0};
+    ASSERT_TRUE(md_topo_gto_pauli_kinetic_energy_density(P[0], G[0], rho[0], grad[0][0], vacuum, 1, &in.desc));
+    EXPECT_TRUE(isnan(P[0][0]));
+    EXPECT_EQ(0.0, G[0][0]);
+    EXPECT_EQ(0.0, rho[0][0]);
+    for (int a = 0; a < 3; ++a) EXPECT_EQ(0.0, grad[0][0][a]);
+
+    volatile int32_t cancel = 1;
+    volatile float progress = -1.0f;
+    in.desc.cancel = &cancel;
+    in.desc.progress = &progress;
+    EXPECT_FALSE(md_topo_gto_pauli_kinetic_energy_density(P[0], G[0], rho[0], &grad[0][0][0], &xyz[0][0], N, &in.desc));
+    EXPECT_EQ(-1.0f, progress);
+    for (int t = 0; t < N; ++t) {
+        EXPECT_TRUE(isnan(P[0][t]));
+        EXPECT_TRUE(isnan(G[0][t]));
+        EXPECT_TRUE(isnan(rho[0][t]));
+        for (int a = 0; a < 3; ++a) EXPECT_TRUE(isnan(grad[0][t][a]));
+    }
+    cancel = 0;
+    EXPECT_TRUE(md_topo_gto_pauli_kinetic_energy_density(P[0], NULL, NULL, NULL, NULL, 0, &in.desc));
+    EXPECT_TRUE(isnan(P[0][0]));
+    in.desc.density_matrix = NULL;
+    EXPECT_FALSE(md_topo_gto_pauli_kinetic_energy_density(P[0], NULL, NULL, NULL, &xyz[0][0], 1, &in.desc));
+    EXPECT_TRUE(isnan(P[0][0]));
+}
+
+typedef struct topo_cancel_state_t {
+    atomic_int calls;
+    int limit;
+} topo_cancel_state_t;
+
+static bool topo_cancel_callback(void* data) {
+    topo_cancel_state_t* state = (topo_cancel_state_t*)data;
+    return atomic_fetch_add_explicit(&state->calls, 1, memory_order_relaxed) >= state->limit;
+}
+
+UTEST(topo_gto, pauli_callback_cancellation) {
+    topo_pauli_input_t in;
+    topo_pauli_init(&in);
+    enum { N = 64 };
+    double xyz[N][3] = {{0}}, P[N], G[N], rho[N], grad[N][3], hess[N][6];
+    topo_cancel_state_t state = { .calls = ATOMIC_VAR_INIT(0), .limit = 0 };
+    in.desc.num_threads = 4;
+    in.desc.cancel_callback = topo_cancel_callback;
+    in.desc.cancel_user_data = &state;
+    EXPECT_FALSE(md_topo_gto_pauli_kinetic_energy_density(P, G, rho, &grad[0][0], &xyz[0][0], N, &in.desc));
+    for (int t = 0; t < N; ++t) {
+        EXPECT_TRUE(isnan(P[t]));
+        EXPECT_TRUE(isnan(G[t]));
+        EXPECT_TRUE(isnan(rho[t]));
+        for (int a = 0; a < 3; ++a) EXPECT_TRUE(isnan(grad[t][a]));
+    }
+    atomic_store(&state.calls, 0);
+    state.limit = 20;
+    EXPECT_FALSE(md_topo_gto_pauli_kinetic_energy_density(P, G, rho, &grad[0][0], &xyz[0][0], N, &in.desc));
+    int filled = 0;
+    for (int t = 0; t < N; ++t) {
+        if (isfinite(P[t])) {
+            ++filled;
+            EXPECT_TRUE(isfinite(G[t]));
+            EXPECT_TRUE(isfinite(rho[t]));
+            for (int a = 0; a < 3; ++a) EXPECT_TRUE(isfinite(grad[t][a]));
+        } else {
+            EXPECT_TRUE(isnan(G[t]));
+            EXPECT_TRUE(isnan(rho[t]));
+        }
+    }
+    EXPECT_GT(filled, 0);
+    EXPECT_LT(filled, N);
+    atomic_store(&state.calls, 0);
+    state.limit = 0;
+    EXPECT_FALSE(md_topo_gto_density_derivatives(rho, &grad[0][0], &hess[0][0], &xyz[0][0], N, &in.desc));
+    for (int t = 0; t < N; ++t) {
+        EXPECT_TRUE(isnan(rho[t]));
+        for (int a = 0; a < 3; ++a) EXPECT_TRUE(isnan(grad[t][a]));
+        for (int a = 0; a < 6; ++a) EXPECT_TRUE(isnan(hess[t][a]));
+    }
+    in.desc.cancel_callback = NULL;
+    ASSERT_TRUE(md_topo_gto_pauli_kinetic_energy_density(P, G, rho, &grad[0][0], &xyz[0][0], N, &in.desc));
+    for (int t = 0; t < N; ++t) EXPECT_TRUE(isfinite(P[t]));
+}
+
 UTEST(topo_gto, deterministic_across_thread_counts) {
     topo_gto_input_t in;
     ASSERT_TRUE(topo_gto_load_water(&in));

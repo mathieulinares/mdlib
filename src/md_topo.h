@@ -152,6 +152,10 @@ typedef struct md_topo_gto_desc_t {
                                          // estimate (the sweep's work is known only as it unfolds) that never
                                          // goes back; 1 once the search has completed
     bool          profile_gpu_kernels;   // GPU sweep only: wait for each kernel and time it (ms_gpu_*); slower, for benchmarks
+    // Optional thread-safe cancellation, checked in addition to the legacy cancel flag. May be called concurrently
+    // by workers; callback and user data must outlive the call. Prefer this with an atomic flag in new consumers.
+    bool        (*cancel_callback)(void* user_data);
+    void*         cancel_user_data;
 } md_topo_gto_desc_t;
 
 typedef struct md_topo_gto_cluster_t {
@@ -241,6 +245,30 @@ bool md_topo_compute_extremum_graph_gto(md_topo_extremum_graph_t* out_graph, md_
 // desc->cancel is honoured; desc->progress is not. False on invalid input or when cancelled.
 bool md_topo_gto_ring_surface_maxima(uint32_t* out_maxima, uint32_t* out_count, uint32_t capacity, const md_topo_gto_desc_t* desc,
                                      const md_topo_extremum_graph_t* graph, const uint32_t* rcps, size_t num_rcps);
+
+// The positive definite kinetic energy density G(r) = 1/2 sum_mu,nu D_mu,nu grad phi_mu . grad phi_nu (Hartree / Bohr^3)
+// of desc's density at each point xyz[3 * t .. 3 * t + 2] (Bohr), and optionally rho there (out_rho may be null).
+// At a critical point the local virial theorem gives the potential energy density V = 1/4 lap rho - 2 G and the
+// total energy density H = G + V. On the CPU, in double, over desc->num_threads; desc->cancel is honoured (returns
+// false). Unfilled values are NaN.
+bool md_topo_gto_kinetic_energy_density(double* out_G, double* out_rho, const double* xyz, size_t num_points, const md_topo_gto_desc_t* desc);
+
+// Pauli kinetic energy density t_P = G - |grad rho|^2 / (8 rho), in Hartree / Bohr^3, at arbitrary xyz points (Bohr).
+// out_pauli is required; out_G, out_rho and out_grad[3 * t + a] may be null. All fields share one AO evaluation.
+// Uses the total density, not spin-resolved fields or a fragment interaction energy; t_P alone is not a repulsion
+// classifier. At a critical point t_P = G. No density floor or nonnegative clamp is applied: cancellation roundoff
+// can give small negative values. Where rho <= 0, t_P is undefined and stored as NaN (including screened vacuum).
+// CPU threading, cancellation, failure return and unfilled NaNs follow md_topo_gto_kinetic_energy_density.
+bool md_topo_gto_pauli_kinetic_energy_density(double* out_pauli, double* out_G, double* out_rho, double* out_grad,
+                                            const double* xyz, size_t num_points, const md_topo_gto_desc_t* desc);
+
+// rho, its gradient (out_grad[3 * t + a], may be null) and its Hessian (out_hess[6 * t ..], the upper triangle
+// xx xy xz yy yz zz, may be null) of desc's density at each point xyz[3 * t .. 3 * t + 2] (Bohr): what a
+// non-covalent interaction (NCI) analysis needs, the reduced gradient and the sign of the Hessian's second
+// eigenvalue. On the CPU, in double, over desc->num_threads; desc->cancel is honoured (returns false). Unfilled
+// values are NaN.
+bool md_topo_gto_density_derivatives(double* out_rho, double* out_grad, double* out_hess, const double* xyz, size_t num_points,
+                                     const md_topo_gto_desc_t* desc);
 
 #if MD_ENABLE_GPU
 // The same search with the octree sweep on the GPU, in fp32 with rigorous rounding margins (every bound

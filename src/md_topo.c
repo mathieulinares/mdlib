@@ -1637,22 +1637,10 @@ static int cpg_local_aos(const cpg_ctx_t* ctx, cpg_scratch_t* sc, const double c
 
 // ----------------------------------------------------------------------------------------------- point field
 
-// rho, grad, Hessian at x (deriv 0..2) over all shells within their screening radius (far, or for the
-// separatrices local: cpg_local_aos).
-static void cpg_point_r(const cpg_ctx_t* ctx, cpg_scratch_t* sc, const double x[3], int deriv, double* rho, double g[3], double H[3][3], bool trace) {
-    int ns = 0;
-    const int n = cpg_local_aos(ctx, sc, x, 0.0, &ns, trace);
-    sc->trace_aos += (uint64_t)n;   // separatrix statistics (read as differences around each path)
-    int k = 0;
-    for (int t = 0; t < ns; ++t) {
-        const cpg_shell_t* s = &ctx->shell[sc->shells[t]];
-        cpg_shell_eval(ctx, s, x, deriv, sc->V + (size_t)k * CPG_NV, CPG_NV);
-        k += s->ncart;
-    }
+static void cpg_point_density_product(const cpg_ctx_t* ctx, cpg_scratch_t* sc, int n, int ndv) {
     // D V for the channels needed (1 for the gradient, 4 for the Hessian). With one channel a row's sum
     // is a single chain of dependent adds; CPG_PT_ROWS rows at a time keep that many chains in flight
     // (separatrices: ~5x in the matrix form). Each row still sums over j in order: the same result.
-    const int ndv = deriv >= 2 ? 4 : 1;
     #define CPG_PT_ROWS 8
     for (int i0 = 0; i0 < n; i0 += CPG_PT_ROWS) {
         const int nr = MIN(CPG_PT_ROWS, n - i0);
@@ -1678,6 +1666,21 @@ static void cpg_point_r(const cpg_ctx_t* ctx, cpg_scratch_t* sc, const double x[
         for (int t = 0; t < nr; ++t) for (int m = 0; m < ndv; ++m) sc->Dv[(size_t)(i0 + t) * CPG_NDV + m] = acc[t][m];
     }
     #undef CPG_PT_ROWS
+}
+
+// rho, grad, Hessian at x (deriv 0..2) over all shells within their screening radius (far, or for the
+// separatrices local: cpg_local_aos).
+static void cpg_point_r(const cpg_ctx_t* ctx, cpg_scratch_t* sc, const double x[3], int deriv, double* rho, double g[3], double H[3][3], bool trace) {
+    int ns = 0;
+    const int n = cpg_local_aos(ctx, sc, x, 0.0, &ns, trace);
+    sc->trace_aos += (uint64_t)n;
+    int k = 0;
+    for (int t = 0; t < ns; ++t) {
+        const cpg_shell_t* s = &ctx->shell[sc->shells[t]];
+        cpg_shell_eval(ctx, s, x, deriv, sc->V + (size_t)k * CPG_NV, CPG_NV);
+        k += s->ncart;
+    }
+    cpg_point_density_product(ctx, sc, n, deriv >= 2 ? 4 : 1);
     double r = 0.0, gg[3] = {0, 0, 0}, HH[3][3] = {{0}};
     for (int i = 0; i < n; ++i) {
         const double* v = sc->V + (size_t)i * CPG_NV;
@@ -1697,6 +1700,31 @@ static void cpg_point_r(const cpg_ctx_t* ctx, cpg_scratch_t* sc, const double x[
 
 static void cpg_point(const cpg_ctx_t* ctx, cpg_scratch_t* sc, const double x[3], int deriv, double* rho, double g[3], double H[3][3]) {
     cpg_point_r(ctx, sc, x, deriv, rho, g, H, false);
+}
+
+// rho and the positive definite kinetic energy density G = 1/2 sum_ij D_ij grad phi_i . grad phi_j at x, over all
+// shells within their far screening radius
+static void cpg_point_kinetic(const cpg_ctx_t* ctx, cpg_scratch_t* sc, const double x[3], double* rho, double* G, double* grad) {
+    int ns = 0;
+    const int n = cpg_local_aos(ctx, sc, x, 0.0, &ns, false);
+    int k = 0;
+    for (int t = 0; t < ns; ++t) {
+        const cpg_shell_t* s = &ctx->shell[sc->shells[t]];
+        cpg_shell_eval(ctx, s, x, 1, sc->V + (size_t)k * CPG_NV, CPG_NV);
+        k += s->ncart;
+    }
+    cpg_point_density_product(ctx, sc, n, 4);
+    double r = 0.0, g = 0.0, gg[3] = {0};
+    for (int i = 0; i < n; ++i) {
+        const double* acc = sc->Dv + (size_t)i * CPG_NDV;
+        const double* v = sc->V + (size_t)i * CPG_NV;
+        r += v[0] * acc[0];
+        g += v[1] * acc[1] + v[2] * acc[2] + v[3] * acc[3];
+        if (grad) for (int a = 0; a < 3; ++a) gg[a] += 2.0 * v[1 + a] * acc[0];
+    }
+    *rho = r;
+    *G = 0.5 * g;
+    if (grad) for (int a = 0; a < 3; ++a) grad[a] = gg[a];
 }
 
 // ----------------------------------------------------------------------------------------------- cube enclosures
@@ -2281,8 +2309,8 @@ typedef struct cpg_worker_t {
     const cpg_ctx_t* ctx;
     cpg_scratch_t sc;
     int tid, nthreads;
-    int job;                            // 0: cube sweep, 1: separatrices, 2: polish, 3: ring surfaces
-    volatile int32_t* cancel;
+    int job;                            // 0: cube sweep, 1: separatrices, 2: polish, 3: ring surfaces, 4: kinetic energy density
+    const md_topo_gto_desc_t* desc;
     cpg_progress_t* prog;               // worker 0 only: reports (prog_base + its position) / prog_total
     double prog_base, prog_total;
     cpg_queue_t* queue;                 // jobs 1, 2 and 3
@@ -2308,6 +2336,14 @@ typedef struct cpg_worker_t {
     // ring surfaces: item t leaves rs_x[t] along rs_dir[t] (md_topo_gto_ring_surface_maxima)
     const double (*rs_x)[3];
     const double (*rs_dir)[3];
+    // kinetic energy density: item t is the point kin_x[t] (md_topo_gto_kinetic_energy_density)
+    const double (*kin_x)[3];
+    double* kin_G;
+    double* kin_rho;
+    double* kin_pauli;
+    // density derivatives: rho, gradient (3) and Hessian (xx xy xz yy yz zz) at kin_x[t]; either array may be null
+    double* der_grad;
+    double* der_hess;
 } cpg_worker_t;
 
 // The root of a cube Krawczyk certified (unique in the 1.5x inflated cube): double Newton from the cube
@@ -2400,13 +2436,18 @@ static int cpg_process_box(cpg_worker_t* w, const cpg_box_t* box, cpg_cp_t* out_
     return children ? (int)(CPG_SPLIT | (children << 8)) : CPG_DISCARD_CHILDREN;
 }
 
+static bool cpg_desc_cancelled(const md_topo_gto_desc_t* desc) {
+    return (desc->cancel && *desc->cancel) ||
+           (desc->cancel_callback && desc->cancel_callback(desc->cancel_user_data));
+}
+
 static void cpg_worker_entry(void* data) {
     cpg_worker_t* w = (cpg_worker_t*)data;
     md_allocator_i* heap = md_get_heap_allocator();
     if (w->job == 0) {
         // fixed interleaved chunks: the result of every cube is independent of which thread computed it
         for (size_t chunk = (size_t)w->tid; chunk * CPG_CHUNK < w->nboxes; chunk += (size_t)w->nthreads) {
-            if (w->cancel && *w->cancel) return;
+            if (cpg_desc_cancelled(w->desc)) return;
             const size_t end = (chunk + 1) * CPG_CHUNK < w->nboxes ? (chunk + 1) * CPG_CHUNK : w->nboxes;
             for (size_t bi = chunk * CPG_CHUNK; bi < end; ++bi) {
                 cpg_rootrec_t rec;
@@ -2419,7 +2460,7 @@ static void cpg_worker_entry(void* data) {
         }
     } else if (w->job == 1) {
         for (int t; (t = cpg_queue_pop(w->queue)) >= 0; ) {
-            if (w->cancel && *w->cancel) return;
+            if (cpg_desc_cancelled(w->desc)) return;
             cpg_progress_set(w->prog, (w->prog_base + (double)t) / w->prog_total);
             const int i = w->traces[t] / 2, e = w->traces[t] % 2;
             const cpg_cp_t* cp = &w->cps[w->saddles[i]];
@@ -2440,13 +2481,45 @@ static void cpg_worker_entry(void* data) {
         }
     } else if (w->job == 2) {
         for (int t; (t = cpg_queue_pop(w->queue)) >= 0; ) {
-            if (w->cancel && *w->cancel) return;
+            if (cpg_desc_cancelled(w->desc)) return;
             cpg_progress_set(w->prog, (w->prog_base + (double)t) / w->prog_total);
             w->pres[t].r = cpg_polish_root(w->ctx, &w->sc, &w->pboxes[t], &w->pres[t].cp);
         }
+    } else if (w->job == 4) {
+        for (int t; (t = cpg_queue_pop(w->queue)) >= 0; ) {
+            if (cpg_desc_cancelled(w->desc)) return;
+            double rho, G, grad[3];
+            cpg_point_kinetic(w->ctx, &w->sc, w->kin_x[t], &rho, &G, (w->kin_pauli || w->der_grad) ? grad : NULL);
+            if (w->kin_rho) w->kin_rho[t] = rho;
+            if (w->kin_G) w->kin_G[t] = G;
+            if (w->der_grad) for (int a = 0; a < 3; ++a) w->der_grad[3 * (size_t)t + a] = grad[a];
+            if (w->kin_pauli) {
+                double W = NAN;
+                if (rho > 0.0) {
+                    // Divide before squaring to retain dilute tails without squaring rho or grad.
+                    const double inv_sqrt_rho = 1.0 / sqrt(rho);
+                    const double gx = grad[0] * inv_sqrt_rho;
+                    const double gy = grad[1] * inv_sqrt_rho;
+                    const double gz = grad[2] * inv_sqrt_rho;
+                    W = 0.125 * (gx * gx + gy * gy + gz * gz);
+                }
+                w->kin_pauli[t] = G - W;
+            }
+        }
+    } else if (w->job == 5) {
+        for (int t; (t = cpg_queue_pop(w->queue)) >= 0; ) {
+            if (cpg_desc_cancelled(w->desc)) return;
+            double g[3], H[3][3];
+            cpg_point(w->ctx, &w->sc, w->kin_x[t], w->der_hess ? 2 : w->der_grad ? 1 : 0, &w->kin_rho[t], g, H);
+            if (w->der_grad) for (int a = 0; a < 3; ++a) w->der_grad[3 * (size_t)t + a] = g[a];
+            if (w->der_hess) {
+                double* h = w->der_hess + 6 * (size_t)t;
+                h[0] = H[0][0]; h[1] = H[0][1]; h[2] = H[0][2]; h[3] = H[1][1]; h[4] = H[1][2]; h[5] = H[2][2];
+            }
+        }
     } else {
         for (int t; (t = cpg_queue_pop(w->queue)) >= 0; ) {
-            if (w->cancel && *w->cancel) return;
+            if (cpg_desc_cancelled(w->desc)) return;
             w->ends[t] = cpg_trace(w->ctx, &w->sc, w->rs_x[t], w->rs_dir[t], 1.0, w->cps, w->ncp, MD_TOPO_MAXIMUM, w->sep_rho_hi);
         }
     }
@@ -2524,7 +2597,7 @@ typedef struct cpg_run_t {
 } cpg_run_t;
 
 static bool cpg_run_cancelled(cpg_run_t* R) {
-    if (R->desc->cancel && *R->desc->cancel) R->info.cancelled = true;
+    if (cpg_desc_cancelled(R->desc)) R->info.cancelled = true;
     return R->info.cancelled;
 }
 
@@ -2640,7 +2713,7 @@ static void cpg_run_init(cpg_run_t* R, const md_topo_gto_desc_t* desc) {
         R->workers[t].ctx = ctx;
         R->workers[t].tid = t;
         R->workers[t].nthreads = nthreads;
-        R->workers[t].cancel = desc->cancel;
+        R->workers[t].desc = desc;
         R->workers[t].prog = t == 0 ? &R->prog : NULL;
         R->workers[t].h_min = R->h_min;
         cpg_scratch_alloc(&R->workers[t].sc, N, NS, heap);
@@ -3368,7 +3441,7 @@ bool md_topo_gto_ring_surface_maxima(uint32_t* out_maxima, uint32_t* out_count, 
         }
         cpg_run_workers(R.workers, (int)MIN((size_t)R.nthreads, total));
         md_mutex_destroy(&queue.mutex);
-        if (desc->cancel && *desc->cancel) { ok = false; break; }
+        if (cpg_desc_cancelled(desc)) { ok = false; break; }
         for (size_t t = 0; t < total; ++t) {
             const cpg_rs_sample_t smp = { angles[t], ends[t] };
             md_array_push(samples[owner[t]], smp, heap);
@@ -3408,6 +3481,102 @@ bool md_topo_gto_ring_surface_maxima(uint32_t* out_maxima, uint32_t* out_count, 
     md_array_free(angles, heap);
     md_free(heap, vertex, sizeof(uint32_t) * MAX(ncp, 1));
     md_free(heap, cps, sizeof(cpg_cp_t) * MAX(ncp, 1));
+    return ok;
+}
+
+static bool cpg_kinetic_energy_density(double* out_G, double* out_rho, double* out_pauli, double* out_grad,
+                                      const double* xyz, size_t num_points, const md_topo_gto_desc_t* desc, const char* fn) {
+    ASSERT(desc);
+    for (size_t t = 0; t < num_points; ++t) {
+        if (out_G) out_G[t] = NAN;
+        if (out_rho) out_rho[t] = NAN;
+        if (out_pauli) out_pauli[t] = NAN;
+        if (out_grad) for (int a = 0; a < 3; ++a) out_grad[3 * t + a] = NAN;
+    }
+    if (!cpg_check_desc(desc, fn)) return false;
+    if (num_points == 0) return true;
+    if (cpg_desc_cancelled(desc)) return false;
+    if (num_points > INT32_MAX) {
+        MD_LOG_ERROR("%s: too many points (%zu)", fn, num_points);
+        return false;
+    }
+    ASSERT(xyz);
+    md_topo_gto_desc_t d = *desc;
+    d.progress = NULL;
+    cpg_run_t R;
+    cpg_run_init(&R, &d);
+    bool ok = R.ok;
+    if (ok) {
+        cpg_queue_t queue = { .next = 0, .count = (int)num_points };
+        md_mutex_init(&queue.mutex);
+        for (int t = 0; t < R.nthreads; ++t) {
+            cpg_worker_t* wk = &R.workers[t];
+            wk->job = 4;
+            wk->queue = &queue;
+            wk->kin_x = (const double(*)[3])xyz;
+            wk->kin_G = out_G;
+            wk->kin_rho = out_rho;
+            wk->kin_pauli = out_pauli;
+            wk->der_grad = out_grad;
+        }
+        cpg_run_workers(R.workers, (int)MIN((size_t)R.nthreads, num_points));
+        md_mutex_destroy(&queue.mutex);
+        if (cpg_desc_cancelled(desc)) ok = false;
+    }
+    cpg_run_free(&R);
+    return ok;
+}
+
+bool md_topo_gto_kinetic_energy_density(double* out_G, double* out_rho, const double* xyz, size_t num_points, const md_topo_gto_desc_t* desc) {
+    ASSERT(out_G);
+    return cpg_kinetic_energy_density(out_G, out_rho, NULL, NULL, xyz, num_points, desc, "md_topo_gto_kinetic_energy_density");
+}
+
+bool md_topo_gto_pauli_kinetic_energy_density(double* out_pauli, double* out_G, double* out_rho, double* out_grad,
+                                            const double* xyz, size_t num_points, const md_topo_gto_desc_t* desc) {
+    ASSERT(out_pauli);
+    return cpg_kinetic_energy_density(out_G, out_rho, out_pauli, out_grad, xyz, num_points, desc, "md_topo_gto_pauli_kinetic_energy_density");
+}
+
+bool md_topo_gto_density_derivatives(double* out_rho, double* out_grad, double* out_hess, const double* xyz, size_t num_points,
+                                     const md_topo_gto_desc_t* desc) {
+    ASSERT(out_rho);
+    ASSERT(desc);
+    for (size_t t = 0; t < num_points; ++t) {
+        out_rho[t] = NAN;
+        if (out_grad) for (int a = 0; a < 3; ++a) out_grad[3 * t + a] = NAN;
+        if (out_hess) for (int a = 0; a < 6; ++a) out_hess[6 * t + a] = NAN;
+    }
+    if (!cpg_check_desc(desc, "md_topo_gto_density_derivatives")) return false;
+    if (num_points == 0) return true;
+    if (cpg_desc_cancelled(desc)) return false;
+    if (num_points > INT32_MAX) {
+        MD_LOG_ERROR("md_topo_gto_density_derivatives: too many points (%zu)", num_points);
+        return false;
+    }
+    ASSERT(xyz);
+    md_topo_gto_desc_t d = *desc;
+    d.progress = NULL;
+    cpg_run_t R;
+    cpg_run_init(&R, &d);
+    bool ok = R.ok;
+    if (ok) {
+        cpg_queue_t queue = { .next = 0, .count = (int)num_points };
+        md_mutex_init(&queue.mutex);
+        for (int t = 0; t < R.nthreads; ++t) {
+            cpg_worker_t* wk = &R.workers[t];
+            wk->job = 5;
+            wk->queue = &queue;
+            wk->kin_x = (const double(*)[3])xyz;
+            wk->kin_rho = out_rho;
+            wk->der_grad = out_grad;
+            wk->der_hess = out_hess;
+        }
+        cpg_run_workers(R.workers, (int)MIN((size_t)R.nthreads, num_points));
+        md_mutex_destroy(&queue.mutex);
+        if (cpg_desc_cancelled(desc)) ok = false;
+    }
+    cpg_run_free(&R);
     return ok;
 }
 
