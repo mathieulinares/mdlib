@@ -4,6 +4,8 @@
 #include <md_system.h>
 #include <core/md_allocator.h>
 
+#define AMBER_ENERGY_FILE(name) STR_LIT(MD_UNITTEST_SOURCE_DIR "/amber_energy_data/" name)
+
 static md_attribute_id_t amber_energy_publish_run_axis(md_system_t* sys, const double* times, uint32_t count) {
     return md_attributes_create(&sys->attributes, &(md_attribute_desc_t){
         .path = STR_LIT("run/test/time"),
@@ -16,7 +18,7 @@ static md_attribute_id_t amber_energy_publish_run_axis(md_system_t* sys, const d
 }
 
 UTEST(amber_energy, recognizes_and_publishes_mdout_samples) {
-    const str_t path = STR_LIT(MD_UNITTEST_DATA_DIR "/amber-mdout.out");
+    const str_t path = AMBER_ENERGY_FILE("amber-mdout.out");
     ASSERT_TRUE(md_amber_energy_file_is_mdout(path));
 
     md_allocator_i* alloc = md_get_heap_allocator();
@@ -52,7 +54,7 @@ UTEST(amber_energy, recognizes_and_publishes_mdout_samples) {
 }
 
 UTEST(amber_energy, refuses_energy_output_that_does_not_cover_the_run) {
-    const str_t path = STR_LIT(MD_UNITTEST_DATA_DIR "/amber-mdout.out");
+    const str_t path = AMBER_ENERGY_FILE("amber-mdout.out");
     md_allocator_i* alloc = md_get_heap_allocator();
     const double run_time[] = {0.0, 1.0, 3.0};
     md_system_t sys = {.alloc = alloc};
@@ -64,7 +66,7 @@ UTEST(amber_energy, refuses_energy_output_that_does_not_cover_the_run) {
 }
 
 UTEST(amber_energy, rejects_incomplete_records_without_reusing_previous_time) {
-    const str_t path = STR_LIT(MD_UNITTEST_DATA_DIR "/amber-mdout-incomplete.out");
+    const str_t path = AMBER_ENERGY_FILE("amber-mdout-incomplete.out");
     md_system_t sys = {.alloc = md_get_heap_allocator()};
     EXPECT_FALSE(md_amber_energy_system_supplement_from_file(&sys, path, STR_LIT("run/test")));
     EXPECT_TRUE(md_attributes_find(&sys.attributes, STR_LIT("run/test/amber_energy/time")) == NULL);
@@ -72,11 +74,11 @@ UTEST(amber_energy, rejects_incomplete_records_without_reusing_previous_time) {
 }
 
 UTEST(amber_energy, recognizes_and_publishes_mden_records) {
-    const str_t path = STR_LIT(MD_UNITTEST_DATA_DIR "/amber-mden.mden");
+    const str_t path = AMBER_ENERGY_FILE("amber-mden.mden");
     EXPECT_TRUE(md_amber_energy_file_is_mden(path));
     EXPECT_FALSE(md_amber_energy_file_is_mdout(path));
     EXPECT_TRUE(md_amber_energy_file_is_energy(path));
-    EXPECT_FALSE(md_amber_energy_file_is_mden(STR_LIT(MD_UNITTEST_DATA_DIR "/amber-mdout.out")));
+    EXPECT_FALSE(md_amber_energy_file_is_mden(AMBER_ENERGY_FILE("amber-mdout.out")));
 
     md_allocator_i* alloc = md_get_heap_allocator();
     const double run_time[] = {0.0, 1.0, 2.0};
@@ -127,7 +129,7 @@ UTEST(amber_energy, recognizes_and_publishes_mden_records) {
 }
 
 UTEST(amber_energy, rejects_mden_record_lines_that_do_not_match_their_header) {
-    const str_t path = STR_LIT(MD_UNITTEST_DATA_DIR "/amber-mden-bad-columns.mden");
+    const str_t path = AMBER_ENERGY_FILE("amber-mden-bad-columns.mden");
     ASSERT_TRUE(md_amber_energy_file_is_mden(path));
     md_system_t sys = {.alloc = md_get_heap_allocator()};
     EXPECT_FALSE(md_amber_energy_system_supplement_from_file(&sys, path, STR_LIT("run/test")));
