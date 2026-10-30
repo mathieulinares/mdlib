@@ -36,6 +36,7 @@ option(MD_FORCE_ASSERTIONS "Force assertions" OFF)
 # The readers of the HDF5 based formats come as one: they share the one dependency, and a build that
 # has HDF5 has no reason to leave any of them out. Compiled in, they define MD_HDF5.
 option(MD_ENABLE_HDF5 "Enable the HDF5 based readers: VeloxChem, TREXIO and H5MD (requires HDF5)" OFF)
+option(MD_ENABLE_AMBER_NETCDF "Enable Amber NetCDF trajectory support (requires NetCDF-C)" OFF)
 set(MD_GL_BACKBONE_SEGMENT_COUNT "12" CACHE STRING "Segments per residue along the spline of the backbone representations (cartoon, ribbons, even)")
 set(MD_GL_BACKBONE_PROFILE_COUNT "16" CACHE STRING "Vertices around the cross section of the cartoon representation (even)")
 
@@ -120,6 +121,8 @@ set(SRC_FILES
   src/md_atomic_infer.c
   src/md_chem.c
   src/md_chem.h
+  src/md_amber_energy.c
+  src/md_amber_energy.h
   src/md_contact.c
   src/md_contact.h
   src/md_hbond.c
@@ -348,6 +351,16 @@ if (MD_ENABLE_HDF5)
     set(MD_VLX_BASIS_FOLDER "basis")
   endif()
   list(APPEND MD_DEFINES MD_HDF5 MD_VLX_BASIS_FOLDER="${MD_VLX_BASIS_FOLDER}")
+endif()
+
+if (MD_ENABLE_AMBER_NETCDF)
+  find_package(netCDF CONFIG REQUIRED)
+  list(APPEND MD_LIBS netCDF::netcdf)
+  list(APPEND SRC_FILES
+    src/md_amber_netcdf.c
+    src/md_amber_netcdf.h
+  )
+  list(APPEND MD_DEFINES MD_AMBER_NETCDF)
 endif()
 
 create_resources("${GL_SHADER_FILES}"   "gen/gl_shaders.inl")

@@ -6,5 +6,11 @@
       "default-features": false,
       "features": [ "zlib" ]
     }
-  ]
+  ],
+  "features": {
+    "amber-netcdf": {
+      "description": "Amber NetCDF trajectory support",
+      "dependencies": [ "netcdf-c" ]
+    }
+  }
 }

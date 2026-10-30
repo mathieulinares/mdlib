@@ -13,17 +13,20 @@ if (NOT DEFINED CMAKE_TOOLCHAIN_FILE AND DEFINED ENV{VCPKG_ROOT})
     # its default szip feature, which pulls in a libaec source fetch from a host that is regularly
     # unreachable from CI runners.
     #
-    # Gated on HDF5 actually being requested: manifest mode installs the whole manifest at
+    # Gated on a large optional dependency actually being requested: manifest mode installs the whole manifest at
     # configure time, and a build without the HDF5 readers has no use for it. This runs before
     # any option() is declared, so it sees what was passed on the command line or is in the cache:
-    # MD_ENABLE_HDF5 itself, or viamd's QM module, which turns it on.
-    if (MD_ENABLE_HDF5 OR VIAMD_ENABLE_QM OR VIAMD_ENABLE_VELOXCHEM)
+    # MD_ENABLE_HDF5/MD_ENABLE_AMBER_NETCDF themselves, or viamd's QM module, which turns HDF5 on.
+    if (MD_ENABLE_HDF5 OR MD_ENABLE_AMBER_NETCDF OR VIAMD_ENABLE_QM OR VIAMD_ENABLE_VELOXCHEM)
         get_filename_component(MD_VCPKG_MANIFEST_DIR "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
         if (NOT DEFINED VCPKG_MANIFEST_DIR
             AND NOT EXISTS "${CMAKE_SOURCE_DIR}/vcpkg.json"
             AND EXISTS "${MD_VCPKG_MANIFEST_DIR}/vcpkg.json")
             set(VCPKG_MANIFEST_DIR "${MD_VCPKG_MANIFEST_DIR}")
             message(STATUS "Using mdlib vcpkg manifest: ${VCPKG_MANIFEST_DIR}/vcpkg.json")
+        endif()
+        if (MD_ENABLE_AMBER_NETCDF)
+            list(APPEND VCPKG_MANIFEST_FEATURES amber-netcdf)
         endif()
     endif()
 
