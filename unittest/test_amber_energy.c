@@ -65,6 +65,35 @@ UTEST(amber_energy, refuses_energy_output_that_does_not_cover_the_run) {
     md_attributes_free(&sys.attributes);
 }
 
+UTEST(amber_energy, preserves_restarted_runs_as_separate_segments) {
+    const str_t path = AMBER_ENERGY_FILE("amber-mdout-restarted.out");
+    const double run_time[] = {0.0, 1.0};
+    md_system_t sys = {.alloc = md_get_heap_allocator()};
+    sys.attributes.alloc = sys.alloc;
+    ASSERT_NE(MD_ATTRIBUTE_INVALID, amber_energy_publish_run_axis(&sys, run_time, 2));
+    ASSERT_TRUE(md_amber_energy_system_supplement_from_file(&sys, path, STR_LIT("run/test")));
+
+    const md_attribute_t* first_time = md_attributes_find(&sys.attributes, STR_LIT("run/test/amber_energy/segment_1/time"));
+    const md_attribute_t* second_time = md_attributes_find(&sys.attributes, STR_LIT("run/test/amber_energy/segment_2/time"));
+    const md_attribute_t* first_etot = md_attributes_find(&sys.attributes, STR_LIT("run/test/amber_energy/segment_1/etot"));
+    const md_attribute_t* second_etot = md_attributes_find(&sys.attributes, STR_LIT("run/test/amber_energy/segment_2/etot"));
+    ASSERT_TRUE(first_time && second_time && first_etot && second_etot);
+    EXPECT_TRUE(md_attributes_find(&sys.attributes, STR_LIT("run/test/amber_energy/time")) == NULL);
+    EXPECT_EQ(2u, first_time->format.shape[0]);
+    EXPECT_EQ(2u, second_time->format.shape[0]);
+
+    const md_unit_t energy_unit = md_unit_scl(md_unit_div(md_unit_calorie(), md_unit_mole()), 1000.0);
+    double values[2];
+    ASSERT_EQ(2u, md_attribute_extract_f64(values, 2, first_etot, md_attribute_slice_all(), energy_unit));
+    EXPECT_NEAR(-10.0, values[0], 1.0e-12);
+    EXPECT_NEAR(-9.5, values[1], 1.0e-12);
+    ASSERT_EQ(2u, md_attribute_extract_f64(values, 2, second_etot, md_attribute_slice_all(), energy_unit));
+    EXPECT_NEAR(-20.0, values[0], 1.0e-12);
+    EXPECT_NEAR(-19.5, values[1], 1.0e-12);
+    EXPECT_TRUE(md_attributes_find(&sys.attributes, STR_LIT("run/test/amber_energy/source")) != NULL);
+    md_attributes_free(&sys.attributes);
+}
+
 UTEST(amber_energy, rejects_incomplete_records_without_reusing_previous_time) {
     const str_t path = AMBER_ENERGY_FILE("amber-mdout-incomplete.out");
     md_system_t sys = {.alloc = md_get_heap_allocator()};

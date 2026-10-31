@@ -123,6 +123,8 @@ set(SRC_FILES
   src/md_chem.h
   src/md_amber_energy.c
   src/md_amber_energy.h
+  src/md_amber_prmtop.c
+  src/md_amber_prmtop.h
   src/md_contact.c
   src/md_contact.h
   src/md_hbond.c

@@ -155,7 +155,7 @@ static bool nc_validate_spatial_labels(int ncid, int spatial_dim, str_t path) {
     return true;
 }
 
-static bool amber_netcdf_inspect(int ncid, str_t path, amber_netcdf_layout_t* layout) {
+static bool amber_netcdf_inspect(int ncid, str_t path, amber_netcdf_layout_t* layout, bool restart) {
     int format;
     if (!nc_ok(nc_inq_format(ncid, &format), "format query", path)) {
         return false;
@@ -167,26 +167,30 @@ static bool amber_netcdf_inspect(int ncid, str_t path, amber_netcdf_layout_t* la
 
     char conventions[64], convention_version[64];
     if (!nc_get_text_attribute(ncid, NC_GLOBAL, "Conventions", conventions, sizeof(conventions)) ||
-        strcmp(conventions, "AMBER") != 0 ||
+        strcmp(conventions, restart ? "AMBERRESTART" : "AMBER") != 0 ||
         !nc_get_text_attribute(ncid, NC_GLOBAL, "ConventionVersion", convention_version, sizeof(convention_version)) ||
         strcmp(convention_version, "1.0") != 0) {
-        MD_LOG_ERROR("Amber NetCDF: '" STR_FMT "' does not declare the AMBER convention", STR_ARG(path));
+        MD_LOG_ERROR("Amber NetCDF: '" STR_FMT "' does not declare the expected Amber convention", STR_ARG(path));
         return false;
     }
 
-    int frame_dim, atom_dim, spatial_dim;
-    size_t frames, atoms, spatial;
-    if (!nc_ok(nc_inq_dimid(ncid, "frame", &frame_dim), "frame dimension lookup", path) ||
+    int frame_dim = -1, atom_dim, spatial_dim;
+    size_t frames = 1, atoms, spatial;
+    if ((!restart && (!nc_ok(nc_inq_dimid(ncid, "frame", &frame_dim), "frame dimension lookup", path) ||
+                      !nc_ok(nc_inq_dimlen(ncid, frame_dim, &frames), "frame dimension query", path))) ||
         !nc_ok(nc_inq_dimid(ncid, "atom", &atom_dim), "atom dimension lookup", path) ||
         !nc_ok(nc_inq_dimid(ncid, "spatial", &spatial_dim), "spatial dimension lookup", path) ||
-        !nc_ok(nc_inq_dimlen(ncid, frame_dim, &frames), "frame dimension query", path) ||
         !nc_ok(nc_inq_dimlen(ncid, atom_dim, &atoms), "atom dimension query", path) ||
         !nc_ok(nc_inq_dimlen(ncid, spatial_dim, &spatial), "spatial dimension query", path)) {
         return false;
     }
     if (!frames || !atoms || atoms > UINT32_MAX || frames > UINT32_MAX ||
-        atoms > SIZE_MAX / 3 || frames > SIZE_MAX / (9 * sizeof(float)) || spatial != 3) {
+        atoms > SIZE_MAX / (3 * sizeof(float)) || frames > SIZE_MAX / (9 * sizeof(float)) || spatial != 3) {
         MD_LOG_ERROR("Amber NetCDF: invalid frame/atom/spatial dimensions in '" STR_FMT "'", STR_ARG(path));
+        return false;
+    }
+    if (restart && nc_inq_dimid(ncid, "frame", &frame_dim) == NC_NOERR) {
+        MD_LOG_ERROR("Amber NetCDF: restart files must not have a frame dimension");
         return false;
     }
     if (!nc_validate_spatial_labels(ncid, spatial_dim, path)) {
@@ -196,11 +200,12 @@ static bool amber_netcdf_inspect(int ncid, str_t path, amber_netcdf_layout_t* la
     int coordinate_var;
     int coordinate_dims[NC_MAX_VAR_DIMS];
     if (!nc_ok(nc_inq_varid(ncid, "coordinates", &coordinate_var), "coordinates variable lookup", path) ||
-        !nc_variable_shape(ncid, coordinate_var, 3, coordinate_dims) ||
+        !nc_variable_shape(ncid, coordinate_var, restart ? 2 : 3, coordinate_dims) ||
         !nc_variable_is_float(ncid, coordinate_var) ||
-        coordinate_dims[0] != frame_dim || coordinate_dims[1] != atom_dim || coordinate_dims[2] != spatial_dim ||
+        (!restart && coordinate_dims[0] != frame_dim) ||
+        coordinate_dims[restart ? 0 : 1] != atom_dim || coordinate_dims[restart ? 1 : 2] != spatial_dim ||
         !nc_variable_units_are(ncid, coordinate_var, "angstrom")) {
-        MD_LOG_ERROR("Amber NetCDF: coordinates must have shape {frame, atom, spatial} and units 'angstrom' in '" STR_FMT "'", STR_ARG(path));
+        MD_LOG_ERROR("Amber NetCDF: coordinates have invalid dimensions or units in '" STR_FMT "'", STR_ARG(path));
         return false;
     }
     double coordinate_fill_value = 0.0, coordinate_missing_value = 0.0;
@@ -216,8 +221,8 @@ static bool amber_netcdf_inspect(int ncid, str_t path, amber_netcdf_layout_t* la
     if (has_time) {
         int dims[NC_MAX_VAR_DIMS];
         size_t length;
-        if (!nc_variable_shape(ncid, time_var, 1, dims) || !nc_variable_is_float(ncid, time_var) || dims[0] != frame_dim ||
-            nc_inq_dimlen(ncid, dims[0], &length) != NC_NOERR || length != frames ||
+        if (!nc_variable_shape(ncid, time_var, restart ? 0 : 1, dims) || !nc_variable_is_float(ncid, time_var) ||
+            (!restart && (dims[0] != frame_dim || nc_inq_dimlen(ncid, dims[0], &length) != NC_NOERR || length != frames)) ||
             !nc_variable_units_are(ncid, time_var, "picosecond")) {
             MD_LOG_ERROR("Amber NetCDF: time must have one value per frame and units 'picosecond' in '" STR_FMT "'", STR_ARG(path));
             return false;
@@ -247,11 +252,11 @@ static bool amber_netcdf_inspect(int ncid, str_t path, amber_netcdf_layout_t* la
         int cell_spatial_dim, cell_angular_dim, lengths_dims[NC_MAX_VAR_DIMS], angles_dims[NC_MAX_VAR_DIMS];
         if (nc_inq_dimid(ncid, "cell_spatial", &cell_spatial_dim) != NC_NOERR ||
             nc_inq_dimid(ncid, "cell_angular", &cell_angular_dim) != NC_NOERR ||
-            !nc_variable_shape(ncid, lengths_var, 2, lengths_dims) ||
-            !nc_variable_shape(ncid, angles_var, 2, angles_dims) ||
+            !nc_variable_shape(ncid, lengths_var, restart ? 1 : 2, lengths_dims) ||
+            !nc_variable_shape(ncid, angles_var, restart ? 1 : 2, angles_dims) ||
             !nc_variable_is_float(ncid, lengths_var) || !nc_variable_is_float(ncid, angles_var) ||
-            lengths_dims[0] != frame_dim || angles_dims[0] != frame_dim ||
-            lengths_dims[1] != cell_spatial_dim || angles_dims[1] != cell_angular_dim) {
+            (!restart && (lengths_dims[0] != frame_dim || angles_dims[0] != frame_dim)) ||
+            lengths_dims[restart ? 0 : 1] != cell_spatial_dim || angles_dims[restart ? 0 : 1] != cell_angular_dim) {
             MD_LOG_ERROR("Amber NetCDF: cell variables have invalid dimensions in '" STR_FMT "'", STR_ARG(path));
             return false;
         }
@@ -313,8 +318,12 @@ bool md_amber_netcdf_file_is_trajectory(str_t filename) {
     lock_netcdf();
     int ncid = -1;
     amber_netcdf_layout_t layout = {0};
-    const bool ok = nc_open(path, NC_NOWRITE, &ncid) == NC_NOERR &&
-        amber_netcdf_inspect(ncid, filename, &layout);
+    const bool opened = nc_open(path, NC_NOWRITE, &ncid) == NC_NOERR;
+    char convention[64];
+    const bool is_restart = opened &&
+        nc_get_text_attribute(ncid, NC_GLOBAL, "Conventions", convention, sizeof(convention)) &&
+        strcmp(convention, "AMBERRESTART") == 0;
+    const bool ok = opened && !is_restart && amber_netcdf_inspect(ncid, filename, &layout, false);
     if (ncid >= 0) {
         nc_close(ncid);
     }
@@ -357,6 +366,79 @@ static bool cell_from_lengths_angles(float out[9], const double lengths[3], cons
         }
     }
     return out[8] > 0.0f;
+}
+
+bool md_amber_netcdf_state_init_from_file(md_system_state_t* state, str_t filename, size_t num_atoms) {
+    ASSERT(state);
+    if (!state->alloc || str_empty(filename) || filename.len >= AMBER_NETCDF_PATH_CAP) {
+        MD_LOG_ERROR("Amber NetCDF: invalid coordinate path or state allocator");
+        return false;
+    }
+    char path[AMBER_NETCDF_PATH_CAP];
+    str_copy_to_char_buf(path, sizeof(path), filename);
+    md_temp_scope_t temp = md_temp_begin_avoid(state->alloc);
+    float* coordinates = NULL;
+    md_unitcell_t cell = {0};
+    bool ok = false;
+    int ncid = -1;
+    amber_netcdf_layout_t layout = {0};
+    lock_netcdf();
+    if (!nc_ok(nc_open(path, NC_NOWRITE, &ncid), "open", filename)) goto close;
+    char convention[64];
+    const bool restart = nc_get_text_attribute(ncid, NC_GLOBAL, "Conventions", convention, sizeof(convention)) &&
+                         strcmp(convention, "AMBERRESTART") == 0;
+    if (!amber_netcdf_inspect(ncid, filename, &layout, restart)) goto close;
+    if (layout.num_atoms != num_atoms) {
+        MD_LOG_ERROR("Amber NetCDF: %zu coordinate atoms do not match the topology's %zu atoms", layout.num_atoms, num_atoms);
+        goto close;
+    }
+    coordinates = md_temp_alloc_array(temp, float, num_atoms * 3);
+    const size_t start[3] = {0, 0, 0}, count[3] = {1, num_atoms, 3};
+    if (!nc_ok(nc_get_vara_float(ncid, layout.coordinate_var, start + restart, count + restart, coordinates),
+               "initial coordinate read", filename)) goto close;
+    for (size_t i = 0; i < num_atoms * 3; ++i) {
+        if (is_missing_double(coordinates[i], layout.has_coordinate_fill_value, (float)layout.coordinate_fill_value,
+                              layout.has_coordinate_missing_value, (float)layout.coordinate_missing_value)) {
+            MD_LOG_ERROR("Amber NetCDF: missing or non-finite initial coordinate in '" STR_FMT "'", STR_ARG(filename));
+            goto close;
+        }
+    }
+    if (layout.has_cell) {
+        double lengths[3], angles[3];
+        const size_t cell_start[2] = {0, 0}, cell_count[2] = {1, 3};
+        if (!nc_ok(nc_get_vara_double(ncid, layout.cell_lengths_var, cell_start + restart, cell_count + restart, lengths),
+                   "initial cell length read", filename) ||
+            !nc_ok(nc_get_vara_double(ncid, layout.cell_angles_var, cell_start + restart, cell_count + restart, angles),
+                   "initial cell angle read", filename)) goto close;
+        for (size_t i = 0; i < 3; ++i) {
+            if (is_missing_double(lengths[i], layout.has_cell_lengths_fill_value, layout.cell_lengths_fill_value,
+                                  layout.has_cell_lengths_missing_value, layout.cell_lengths_missing_value) ||
+                is_missing_double(angles[i], layout.has_cell_angles_fill_value, layout.cell_angles_fill_value,
+                                  layout.has_cell_angles_missing_value, layout.cell_angles_missing_value)) {
+                MD_LOG_ERROR("Amber NetCDF: missing initial periodic-cell value in '" STR_FMT "'", STR_ARG(filename));
+                goto close;
+            }
+        }
+        float basis[9];
+        if (!cell_from_lengths_angles(basis, lengths, angles)) {
+            MD_LOG_ERROR("Amber NetCDF: invalid initial periodic cell in '" STR_FMT "'", STR_ARG(filename));
+            goto close;
+        }
+        cell = md_unitcell_from_extent_and_angles(lengths[0], lengths[1], lengths[2], angles[0], angles[1], angles[2]);
+    }
+    ok = true;
+close:
+    if (ncid >= 0 && !nc_ok(nc_close(ncid), "close", filename)) ok = false;
+    unlock_netcdf();
+    if (ok) {
+        ok = md_system_state_init(state, num_atoms);
+        if (ok) {
+            memcpy(state->xyz, coordinates, num_atoms * sizeof(vec3_t));
+            state->unitcell = cell;
+        }
+    }
+    md_temp_end(temp);
+    return ok;
 }
 
 static size_t amber_netcdf_position_provider(void* dst, size_t cap, const md_attribute_t* attr,
@@ -441,7 +523,7 @@ bool md_amber_netcdf_system_publish_run(md_system_t* sys, str_t filename, str_t 
     if (status != NC_NOERR) {
         nc_ok(status, "open", path);
     }
-    const bool inspected = status == NC_NOERR && amber_netcdf_inspect(ncid, path, &layout);
+    const bool inspected = status == NC_NOERR && amber_netcdf_inspect(ncid, path, &layout, false);
     bool data_ok = inspected;
     double* times = NULL;
     float* cells = NULL;

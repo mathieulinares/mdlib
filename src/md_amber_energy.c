@@ -28,6 +28,11 @@ typedef struct amber_energy_term_t {
     size_t present;
 } amber_energy_term_t;
 
+typedef struct amber_energy_segment_t {
+    size_t first_row;
+    size_t num_rows;
+} amber_energy_segment_t;
+
 typedef struct amber_energy_record_t {
     bool active;
     bool has_step;
@@ -42,8 +47,13 @@ typedef struct amber_energy_record_t {
 typedef struct amber_energy_data_t {
     double* time;
     amber_energy_term_t* terms;
+    amber_energy_segment_t* segments;
     size_t num_rows;
+    double previous_step;
+    bool has_previous_step;
 } amber_energy_data_t;
+
+static str_t amber_join(char* buf, size_t cap, str_t a, str_t b);
 
 static bool ascii_contains_ignore_case(const char* text, size_t text_len, const char* needle, size_t needle_len) {
     if (!text || !needle || needle_len == 0 || text_len < needle_len) return false;
@@ -187,14 +197,21 @@ static bool amber_record_finalize(amber_energy_data_t* data, amber_energy_record
         MD_LOG_ERROR("Amber mdout: incomplete energy record; NSTEP, TIME(PS), and Etot are required");
         return false;
     }
-    if (data->num_rows && record->time < data->time[data->num_rows - 1]) {
-        MD_LOG_ERROR("Amber mdout: time decreases at record %zu (%g ps after %g ps); restarted output must be separated before loading",
-            data->num_rows, record->time, data->time[data->num_rows - 1]);
-        return false;
-    }
     if (data->num_rows == UINT32_MAX) {
         MD_LOG_ERROR("Amber mdout: too many energy records");
         return false;
+    }
+
+    const bool new_segment = data->num_rows == 0 ||
+        record->time < data->time[data->num_rows - 1] ||
+        (data->has_previous_step && record->step < data->previous_step);
+    if (new_segment) {
+        if (data->num_rows) {
+            MD_LOG_INFO("Amber energy WARNING: restart detected at record %zu (step %.0f, %.9g ps); "
+                        "publishing each run segment separately without changing its timestamps",
+                        data->num_rows, record->step, record->time);
+        }
+        md_array_push(data->segments, ((amber_energy_segment_t){data->num_rows, 0}), alloc);
     }
 
     for (size_t i = 0; i < record->num_values; ++i) {
@@ -221,6 +238,9 @@ static bool amber_record_finalize(amber_energy_data_t* data, amber_energy_record
         md_array_push(term->values, value, alloc);
     }
     ++data->num_rows;
+    ++data->segments[md_array_size(data->segments) - 1].num_rows;
+    data->previous_step = record->step;
+    data->has_previous_step = true;
     record->active = false;
     record->has_step = false;
     record->has_time = false;
@@ -228,6 +248,73 @@ static bool amber_record_finalize(amber_energy_data_t* data, amber_energy_record
     record->step = 0.0;
     record->time = 0.0;
     record->num_values = 0;
+    return true;
+}
+
+static bool amber_energy_validate_run_coverage(const md_system_t* sys, str_t run,
+                                              const amber_energy_data_t* data,
+                                              md_allocator_i* alloc) {
+    char path_buf[512];
+    const str_t run_time_path = amber_join(path_buf, sizeof(path_buf), run, STR_LIT("time"));
+    const md_attribute_t* run_axis = md_attributes_find(&sys->attributes, run_time_path);
+    if (!run_axis || md_attributes_axis(&sys->attributes, run_axis) != run_axis) {
+        return true;
+    }
+
+    md_attributes_t probe = {.alloc = alloc};
+    const size_t num_segments = md_array_size(data->segments);
+    md_temp_scope_t temp = md_temp_begin_avoid(alloc);
+    const md_attribute_t** energy_axes = md_temp_alloc_array(temp, const md_attribute_t*, num_segments);
+    if (!energy_axes) {
+        md_attributes_free(&probe);
+        md_temp_end(temp);
+        MD_LOG_ERROR("Amber energy: failed to allocate segment time axes");
+        return false;
+    }
+
+    for (size_t s = 0; s < num_segments; ++s) {
+        const amber_energy_segment_t* segment = &data->segments[s];
+        char axis_path[64];
+        md_snprintf(axis_path, sizeof(axis_path), "segment_%zu/time", s + 1);
+        const md_attribute_id_t axis_id = md_attributes_create(&probe, &(md_attribute_desc_t){
+            .path = str_from_cstr(axis_path),
+            .format = {.type = MD_ATTRIBUTE_TYPE_F64, .components = 1, .rank = 1, .shape = {(uint32_t)segment->num_rows}},
+            .flags = MD_ATTRIBUTE_FLAG_TEMPORAL,
+            .unit = md_unit_picosecond(),
+            .label = STR_LIT("Time"),
+            .data = data->time + segment->first_row,
+            .byte_size = segment->num_rows * sizeof(double),
+        });
+        energy_axes[s] = axis_id != MD_ATTRIBUTE_INVALID ? md_attributes_get(&probe, axis_id) : NULL;
+        if (!energy_axes[s]) {
+            md_attributes_free(&probe);
+            md_temp_end(temp);
+            MD_LOG_ERROR("Amber energy: failed to create time axis for segment %zu", s + 1);
+            return false;
+        }
+    }
+
+    for (size_t f = 0; f < run_axis->format.shape[0]; ++f) {
+        bool mapped = false;
+        for (size_t s = 0; s < num_segments; ++s) {
+            size_t row;
+            if (md_attribute_axis_map(&row, run_axis, f, energy_axes[s])) {
+                mapped = true;
+                break;
+            }
+        }
+        if (!mapped) {
+            double time = 0.0;
+            md_attribute_extract_f64(&time, 1, run_axis, md_attribute_slice_1((uint32_t)f), md_unit_picosecond());
+            MD_LOG_ERROR("Amber energy: frame %zu of '" STR_FMT "' (%g ps) has no matching energy record; the file may belong to another run",
+                         f, STR_ARG(run), time);
+            md_attributes_free(&probe);
+            md_temp_end(temp);
+            return false;
+        }
+    }
+    md_attributes_free(&probe);
+    md_temp_end(temp);
     return true;
 }
 
@@ -521,82 +608,79 @@ bool md_amber_energy_system_supplement_from_file(md_system_t* sys, str_t filenam
         goto done;
     }
 
-    md_attributes_t probe = {.alloc = alloc};
-    const md_attribute_id_t axis_id = md_attributes_create(&probe, &(md_attribute_desc_t){
-        .path = STR_LIT("time"),
-        .format = {.type = MD_ATTRIBUTE_TYPE_F64, .components = 1, .rank = 1, .shape = {(uint32_t)data.num_rows}},
-        .flags = MD_ATTRIBUTE_FLAG_TEMPORAL,
-        .unit = md_unit_picosecond(),
-        .label = STR_LIT("Time"),
-        .data = data.time,
-        .byte_size = data.num_rows * sizeof(double),
-    });
-    const md_attribute_t* energy_axis = axis_id ? md_attributes_get(&probe, axis_id) : NULL;
-    if (!energy_axis) {
-        md_attributes_free(&probe);
-        goto done;
-    }
-
-    const str_t run_time_path = amber_join(path_buf, sizeof(path_buf), run, STR_LIT("time"));
-    const md_attribute_t* run_axis = md_attributes_find(&sys->attributes, run_time_path);
-    if (run_axis && md_attributes_axis(&sys->attributes, run_axis) == run_axis) {
-        for (size_t f = 0; f < run_axis->format.shape[0]; ++f) {
-            size_t row;
-            if (!md_attribute_axis_map(&row, run_axis, f, energy_axis)) {
-                double time = 0.0;
-                md_attribute_extract_f64(&time, 1, run_axis, md_attribute_slice_1((uint32_t)f), md_unit_picosecond());
-                MD_LOG_ERROR("Amber energy: frame %zu of '" STR_FMT "' (%g ps) has no matching energy record; the file may belong to another run",
-                    f, STR_ARG(run), time);
-                md_attributes_free(&probe);
-                goto done;
-            }
-        }
-    }
-    md_attributes_free(&probe);
+    if (!amber_energy_validate_run_coverage(sys, run, &data, alloc)) goto done;
 
     md_attributes_remove_prefix(&sys->attributes, group);
-    bool published = md_attributes_create(&sys->attributes, &(md_attribute_desc_t){
-        .path = amber_join(path_buf, sizeof(path_buf), group, STR_LIT("time")),
-        .format = {.type = MD_ATTRIBUTE_TYPE_F64, .components = 1, .rank = 1, .shape = {(uint32_t)data.num_rows}},
-        .flags = MD_ATTRIBUTE_FLAG_TEMPORAL,
-        .unit = md_unit_picosecond(),
-        .label = STR_LIT("Time"),
-        .data = data.time,
-        .byte_size = data.num_rows * sizeof(double),
-    }) != MD_ATTRIBUTE_INVALID;
+    const size_t num_segments = md_array_size(data.segments);
+    bool published = true;
+    if (num_segments > 1) {
+        MD_LOG_INFO("Amber energy WARNING: preserving %zu restarted segments under '" STR_FMT
+                    "/segment_1, /segment_2, ...; timestamps are unchanged",
+                    num_segments, STR_ARG(group));
+    }
 
-    md_array(str_t) taken = 0;
-    md_array_push(taken, STR_LIT("time"), alloc);
-    md_array_push(taken, STR_LIT("source"), alloc);
-    for (size_t i = 0; published && i < md_array_size(data.terms); ++i) {
-        amber_energy_term_t* term = &data.terms[i];
-        if (term->present != data.num_rows) {
-            MD_LOG_INFO("Amber energy: omitting '" STR_FMT "' because it is not present in every energy record", STR_ARG(term->name));
-            continue;
+    for (size_t s = 0; published && s < num_segments; ++s) {
+        const amber_energy_segment_t* segment = &data.segments[s];
+        char segment_group_buf[512];
+        char time_path_buf[512];
+        char term_path_buf[512];
+        char segment_name[32];
+        str_t segment_group = group;
+        if (num_segments > 1) {
+            md_snprintf(segment_name, sizeof(segment_name), "segment_%zu", s + 1);
+            segment_group = amber_join(segment_group_buf, sizeof(segment_group_buf), group, str_from_cstr(segment_name));
         }
-        char slug_buf[AMBER_MAX_TERM_NAME];
-        size_t slug_len = amber_make_slug(slug_buf, sizeof(slug_buf) - 8, term->name);
-        if (!slug_len) slug_len = (size_t)md_snprintf(slug_buf, sizeof(slug_buf), "term%zu", i + 1);
-        const size_t base_len = slug_len;
-        for (int n = 2;; ++n) {
-            bool clash = false;
-            for (size_t k = 0; k < md_array_size(taken); ++k) {
-                if (str_eq(taken[k], (str_t){slug_buf, slug_len})) { clash = true; break; }
+        const str_t time_path = amber_join(time_path_buf, sizeof(time_path_buf), segment_group, STR_LIT("time"));
+        published = !str_empty(segment_group) && !str_empty(time_path) &&
+            md_attributes_create(&sys->attributes, &(md_attribute_desc_t){
+                .path = time_path,
+                .format = {.type = MD_ATTRIBUTE_TYPE_F64, .components = 1, .rank = 1, .shape = {(uint32_t)segment->num_rows}},
+                .flags = MD_ATTRIBUTE_FLAG_TEMPORAL,
+                .unit = md_unit_picosecond(),
+                .label = STR_LIT("Time"),
+                .data = data.time + segment->first_row,
+                .byte_size = segment->num_rows * sizeof(double),
+            }) != MD_ATTRIBUTE_INVALID;
+
+        md_array(str_t) taken = 0;
+        md_array_push(taken, STR_LIT("time"), alloc);
+        md_array_push(taken, STR_LIT("source"), alloc);
+        for (size_t i = 0; published && i < md_array_size(data.terms); ++i) {
+            amber_energy_term_t* term = &data.terms[i];
+            bool complete = true;
+            for (size_t r = 0; r < segment->num_rows; ++r) {
+                complete &= isfinite(term->values[segment->first_row + r]);
             }
-            if (!clash) break;
-            slug_len = base_len + (size_t)md_snprintf(slug_buf + base_len, sizeof(slug_buf) - base_len, "_%d", n);
+            if (!complete) {
+                MD_LOG_INFO("Amber energy: omitting '" STR_FMT "' from segment %zu because it is not present in every record",
+                            STR_ARG(term->name), s + 1);
+                continue;
+            }
+            char slug_buf[AMBER_MAX_TERM_NAME];
+            size_t slug_len = amber_make_slug(slug_buf, sizeof(slug_buf) - 8, term->name);
+            if (!slug_len) slug_len = (size_t)md_snprintf(slug_buf, sizeof(slug_buf), "term%zu", i + 1);
+            const size_t base_len = slug_len;
+            for (int n = 2;; ++n) {
+                bool clash = false;
+                for (size_t k = 0; k < md_array_size(taken); ++k) {
+                    if (str_eq(taken[k], (str_t){slug_buf, slug_len})) { clash = true; break; }
+                }
+                if (!clash) break;
+                slug_len = base_len + (size_t)md_snprintf(slug_buf + base_len, sizeof(slug_buf) - base_len, "_%d", n);
+            }
+            md_array_push(taken, str_copy((str_t){slug_buf, slug_len}, alloc), alloc);
+            const str_t path = amber_join(term_path_buf, sizeof(term_path_buf), segment_group, (str_t){slug_buf, slug_len});
+            published = !str_empty(path) && md_attributes_create(&sys->attributes, &(md_attribute_desc_t){
+                .path = path,
+                .format = {.type = MD_ATTRIBUTE_TYPE_F64, .components = 1, .rank = 1, .shape = {(uint32_t)segment->num_rows}},
+                .flags = MD_ATTRIBUTE_FLAG_TEMPORAL,
+                .unit = amber_energy_unit(term->slug),
+                .label = term->name,
+                .data = term->values + segment->first_row,
+                .byte_size = segment->num_rows * sizeof(double),
+            }) != MD_ATTRIBUTE_INVALID;
         }
-        md_array_push(taken, str_copy((str_t){slug_buf, slug_len}, alloc), alloc);
-        const str_t path = amber_join(path_buf, sizeof(path_buf), group, (str_t){slug_buf, slug_len});
-        published = !str_empty(path) && md_attributes_create(&sys->attributes, &(md_attribute_desc_t){
-            .path = path,
-            .format = {.type = MD_ATTRIBUTE_TYPE_F64, .components = 1, .rank = 1, .shape = {(uint32_t)data.num_rows}},
-            .flags = MD_ATTRIBUTE_FLAG_TEMPORAL,
-            .unit = amber_energy_unit(term->slug),
-            .label = term->name,
-            .data = term->values,
-            .byte_size = data.num_rows * sizeof(double),
-        }) != MD_ATTRIBUTE_INVALID;
+        md_array_free(taken, alloc);
     }
 
     if (published) {
