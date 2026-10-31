@@ -1,0 +1,16 @@
+Amber 22
+
+   4.  RESULTS
+ NSTEP = 0 TIME(PS) = 0.000 Etot = -10.000
+ NSTEP = 1 TIME(PS) = 1.000 Etot = -9.500
+
+      A V E R A G E S   O V E R     1 S T E P S
+ NSTEP = 1 TIME(PS) = 1.000 Etot = 100.000
+      R M S  F L U C T U A T I O N S
+ NSTEP = 1 TIME(PS) = 1.000 Etot = 200.000
+   5.  TIMINGS
+
+Amber 22
+   4.  RESULTS
+ NSTEP = 1 TIME(PS) = 1.000 Etot = -20.000
+ NSTEP = 2 TIME(PS) = 2.000 Etot = -19.500

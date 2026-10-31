@@ -4,6 +4,9 @@
 #include <md_system.h>
 #include <core/md_allocator.h>
 
+#include <stdio.h>
+#include <string.h>
+
 #define AMBER_ENERGY_FILE(name) STR_LIT(MD_UNITTEST_SOURCE_DIR "/amber_energy_data/" name)
 
 static md_attribute_id_t amber_energy_publish_run_axis(md_system_t* sys, const double* times, uint32_t count) {
@@ -43,6 +46,7 @@ UTEST(amber_energy, recognizes_and_publishes_mdout_samples) {
     EXPECT_NEAR(-10.0, values[0], 1.0e-12);
     EXPECT_NEAR(-9.5, values[1], 1.0e-12);
     EXPECT_NEAR(-9.0, values[2], 1.0e-12);
+    EXPECT_TRUE(md_attributes_find(&sys.attributes, STR_LIT("run/test/amber_energy/ke_trans")) == NULL);
 
     const md_attribute_t* pair_nb = md_attributes_find(&sys.attributes, STR_LIT("run/test/amber_energy/1_4_nb"));
     ASSERT_TRUE(pair_nb != NULL);
@@ -92,6 +96,95 @@ UTEST(amber_energy, preserves_restarted_runs_as_separate_segments) {
     EXPECT_NEAR(-19.5, values[1], 1.0e-12);
     EXPECT_TRUE(md_attributes_find(&sys.attributes, STR_LIT("run/test/amber_energy/source")) != NULL);
     md_attributes_free(&sys.attributes);
+}
+
+static void check_concatenated_energy_file(int* utest_result, str_t path) {
+    const double run_time[] = {0.0, 1.0, 2.0};
+    md_system_t sys = {.alloc = md_get_heap_allocator()};
+    sys.attributes.alloc = sys.alloc;
+    ASSERT_NE(MD_ATTRIBUTE_INVALID, amber_energy_publish_run_axis(&sys, run_time, 3));
+    ASSERT_TRUE(md_amber_energy_system_supplement_from_file(&sys, path, STR_LIT("run/test")));
+
+    const md_attribute_t* first = md_attributes_find(&sys.attributes, STR_LIT("run/test/amber_energy/segment_1/etot"));
+    const md_attribute_t* second = md_attributes_find(&sys.attributes, STR_LIT("run/test/amber_energy/segment_2/etot"));
+    ASSERT_TRUE(first && second);
+    EXPECT_EQ(2u, first->format.shape[0]);
+    EXPECT_EQ(2u, second->format.shape[0]);
+    const md_unit_t unit = md_unit_scl(md_unit_div(md_unit_calorie(), md_unit_mole()), 1000.0);
+    double values[2];
+    ASSERT_EQ(2u, md_attribute_extract_f64(values, 2, first, md_attribute_slice_all(), unit));
+    EXPECT_NEAR(-10.0, values[0], 1.0e-12);
+    EXPECT_NEAR(-9.5, values[1], 1.0e-12);
+    ASSERT_EQ(2u, md_attribute_extract_f64(values, 2, second, md_attribute_slice_all(), unit));
+    EXPECT_NEAR(-20.0, values[0], 1.0e-12);
+    EXPECT_NEAR(-19.5, values[1], 1.0e-12);
+    md_attributes_free(&sys.attributes);
+}
+
+UTEST(amber_energy, reads_concatenated_mdout_after_summary_sections) {
+    check_concatenated_energy_file(utest_result, AMBER_ENERGY_FILE("amber-mdout-concatenated.out"));
+}
+
+UTEST(amber_energy, resumes_mdout_at_records_after_timings) {
+    check_concatenated_energy_file(utest_result, AMBER_ENERGY_FILE("amber-mdout-after-timings.out"));
+}
+
+UTEST(amber_energy, separates_mden_runs_with_repeated_boundary_times) {
+    check_concatenated_energy_file(utest_result, AMBER_ENERGY_FILE("amber-mden-concatenated.mden"));
+}
+
+UTEST(amber_energy, validates_coverage_across_many_segments) {
+    const char* filename = "md_unittest_amber_many_segments.out";
+    FILE* file = fopen(filename, "wb");
+    ASSERT_TRUE(file != NULL);
+    for (int i = 0; i < 20; ++i) {
+        fprintf(file, "NSTEP = 0 TIME(PS) = %d Etot = -10\n", i * 10);
+        fprintf(file, "NSTEP = 1 TIME(PS) = %d Etot = -9\n", i * 10 + 1);
+    }
+    ASSERT_EQ(0, fclose(file));
+
+    double run_time[20];
+    for (size_t i = 0; i < 20; ++i) run_time[i] = (double)(i * 10);
+    md_system_t sys = {.alloc = md_get_heap_allocator()};
+    sys.attributes.alloc = sys.alloc;
+    ASSERT_NE(MD_ATTRIBUTE_INVALID, amber_energy_publish_run_axis(&sys, run_time, 20));
+    ASSERT_TRUE(md_amber_energy_system_supplement_from_file(&sys, str_from_cstr(filename), STR_LIT("run/test")));
+    for (size_t i = 0; i < 20; ++i) {
+        char path[128];
+        md_snprintf(path, sizeof(path), "run/test/amber_energy/segment_%zu/time", i + 1);
+        const md_attribute_t* axis = md_attributes_find(&sys.attributes, str_from_cstr(path));
+        ASSERT_TRUE(axis != NULL);
+        double values[2];
+        ASSERT_EQ(2u, md_attribute_extract_f64(values, 2, axis, md_attribute_slice_all(), md_unit_picosecond()));
+        EXPECT_NEAR(run_time[i], values[0], 1.0e-12);
+        EXPECT_NEAR(run_time[i] + 1.0, values[1], 1.0e-12);
+    }
+    md_attributes_free(&sys.attributes);
+    EXPECT_EQ(0, remove(filename));
+}
+
+UTEST(amber_energy, truncates_long_term_names_safely) {
+    const char* filename = "md_unittest_amber_long_term.out";
+    char name[129];
+    memset(name, 'A', 126);
+    name[126] = ' ';
+    name[127] = 'Z';
+    name[128] = '\0';
+    FILE* file = fopen(filename, "wb");
+    ASSERT_TRUE(file != NULL);
+    fprintf(file, "NSTEP = 0 TIME(PS) = 0 Etot = -1 %s = 12\n", name);
+    ASSERT_EQ(0, fclose(file));
+
+    md_system_t sys = {.alloc = md_get_heap_allocator()};
+    ASSERT_TRUE(md_amber_energy_system_supplement_from_file(&sys, str_from_cstr(filename), STR_LIT("run/test")));
+    char slug[120];
+    memset(slug, 'a', sizeof(slug) - 1);
+    slug[sizeof(slug) - 1] = '\0';
+    char path[256];
+    md_snprintf(path, sizeof(path), "run/test/amber_energy/%s", slug);
+    EXPECT_TRUE(md_attributes_find(&sys.attributes, str_from_cstr(path)) != NULL);
+    md_attributes_free(&sys.attributes);
+    EXPECT_EQ(0, remove(filename));
 }
 
 UTEST(amber_energy, rejects_incomplete_records_without_reusing_previous_time) {

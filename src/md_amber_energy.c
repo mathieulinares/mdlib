@@ -51,6 +51,7 @@ typedef struct amber_energy_data_t {
     size_t num_rows;
     double previous_step;
     bool has_previous_step;
+    bool force_new_segment;
 } amber_energy_data_t;
 
 static str_t amber_join(char* buf, size_t cap, str_t a, str_t b);
@@ -76,10 +77,18 @@ typedef enum amber_energy_format_t {
 static amber_energy_format_t amber_energy_detect(str_t filename) {
     md_file_t file = {0};
     if (!md_file_open(&file, filename, MD_FILE_READ)) return AMBER_ENERGY_FORMAT_NONE;
-    char buf[AMBER_FILE_SNIFF_SIZE];
-    const size_t n = md_file_read(file, buf, sizeof(buf));
+    md_temp_scope_t temp = md_temp_begin();
+    char* buf = md_temp_alloc(temp, AMBER_FILE_SNIFF_SIZE);
+    if (!buf) {
+        MD_LOG_ERROR("Amber energy: failed to allocate the file detection buffer");
+        md_file_close(&file);
+        md_temp_end(temp);
+        return AMBER_ENERGY_FORMAT_NONE;
+    }
+    const size_t n = md_file_read(file, buf, AMBER_FILE_SNIFF_SIZE);
     md_file_close(&file);
 
+    amber_energy_format_t format = AMBER_ENERGY_FORMAT_NONE;
     size_t i = 0;
     while (i < n && is_whitespace(buf[i])) ++i;
     if (i + 2 < n && buf[i] == 'L' && buf[i + 1] == '0' && is_whitespace(buf[i + 2])) {
@@ -88,16 +97,15 @@ static amber_energy_format_t amber_energy_detect(str_t filename) {
         if (ascii_contains_ignore_case(buf + i, end - i, "NSTEPS", 6) &&
             ascii_contains_ignore_case(buf + i, end - i, "TIME(PS)", 8) &&
             ascii_contains_ignore_case(buf + i, end - i, "ETOT", 4)) {
-            return AMBER_ENERGY_FORMAT_MDEN;
+            format = AMBER_ENERGY_FORMAT_MDEN;
         }
-        return AMBER_ENERGY_FORMAT_NONE;
+    } else if (ascii_contains_ignore_case(buf, n, "NSTEP", 5) &&
+               ascii_contains_ignore_case(buf, n, "TIME(PS)", 8) &&
+               ascii_contains_ignore_case(buf, n, "ETOT", 4)) {
+        format = AMBER_ENERGY_FORMAT_MDOUT;
     }
-    if (ascii_contains_ignore_case(buf, n, "NSTEP", 5) &&
-        ascii_contains_ignore_case(buf, n, "TIME(PS)", 8) &&
-        ascii_contains_ignore_case(buf, n, "ETOT", 4)) {
-        return AMBER_ENERGY_FORMAT_MDOUT;
-    }
-    return AMBER_ENERGY_FORMAT_NONE;
+    md_temp_end(temp);
+    return format;
 }
 
 bool md_amber_energy_file_is_mdout(str_t filename) {
@@ -113,12 +121,18 @@ bool md_amber_energy_file_is_energy(str_t filename) {
 }
 
 static size_t amber_make_slug(char* dst, size_t cap, str_t name) {
+    if (!cap) return 0;
     size_t len = 0;
     bool separator = false;
-    for (size_t i = 0; i < name.len && len + 1 < cap; ++i) {
+    for (size_t i = 0; i < name.len; ++i) {
         const unsigned char c = (unsigned char)name.ptr[i];
         if (is_alpha(c) || is_digit(c)) {
-            if (separator && len) dst[len++] = '_';
+            if (separator && len) {
+                if (len + 2 >= cap) break;
+                dst[len++] = '_';
+            } else if (len + 1 >= cap) {
+                break;
+            }
             dst[len++] = (char)to_lower(c);
             separator = false;
         } else {
@@ -202,7 +216,7 @@ static bool amber_record_finalize(amber_energy_data_t* data, amber_energy_record
         return false;
     }
 
-    const bool new_segment = data->num_rows == 0 ||
+    const bool new_segment = data->num_rows == 0 || data->force_new_segment ||
         record->time < data->time[data->num_rows - 1] ||
         (data->has_previous_step && record->step < data->previous_step);
     if (new_segment) {
@@ -241,6 +255,7 @@ static bool amber_record_finalize(amber_energy_data_t* data, amber_energy_record
     ++data->segments[md_array_size(data->segments) - 1].num_rows;
     data->previous_step = record->step;
     data->has_previous_step = true;
+    data->force_new_segment = false;
     record->active = false;
     record->has_step = false;
     record->has_time = false;
@@ -264,7 +279,7 @@ static bool amber_energy_validate_run_coverage(const md_system_t* sys, str_t run
     md_attributes_t probe = {.alloc = alloc};
     const size_t num_segments = md_array_size(data->segments);
     md_temp_scope_t temp = md_temp_begin_avoid(alloc);
-    const md_attribute_t** energy_axes = md_temp_alloc_array(temp, const md_attribute_t*, num_segments);
+    md_attribute_id_t* energy_axes = md_temp_alloc_array(temp, md_attribute_id_t, num_segments);
     if (!energy_axes) {
         md_attributes_free(&probe);
         md_temp_end(temp);
@@ -285,8 +300,8 @@ static bool amber_energy_validate_run_coverage(const md_system_t* sys, str_t run
             .data = data->time + segment->first_row,
             .byte_size = segment->num_rows * sizeof(double),
         });
-        energy_axes[s] = axis_id != MD_ATTRIBUTE_INVALID ? md_attributes_get(&probe, axis_id) : NULL;
-        if (!energy_axes[s]) {
+        energy_axes[s] = axis_id;
+        if (axis_id == MD_ATTRIBUTE_INVALID) {
             md_attributes_free(&probe);
             md_temp_end(temp);
             MD_LOG_ERROR("Amber energy: failed to create time axis for segment %zu", s + 1);
@@ -298,7 +313,8 @@ static bool amber_energy_validate_run_coverage(const md_system_t* sys, str_t run
         bool mapped = false;
         for (size_t s = 0; s < num_segments; ++s) {
             size_t row;
-            if (md_attribute_axis_map(&row, run_axis, f, energy_axes[s])) {
+            const md_attribute_t* axis = md_attributes_get(&probe, energy_axes[s]);
+            if (axis && md_attribute_axis_map(&row, run_axis, f, axis)) {
                 mapped = true;
                 break;
             }
@@ -426,6 +442,21 @@ static str_t amber_join(char* buf, size_t cap, str_t a, str_t b) {
     return (str_t){buf, len};
 }
 
+static bool amber_mdout_section_header(str_t line, str_t number, str_t name) {
+    line = str_trim(line);
+    if (!str_begins_with(line, number)) return false;
+    return str_eq_ignore_case(str_trim(str_substr(line, number.len, SIZE_MAX)), name);
+}
+
+static bool amber_mdout_record_separator(str_t line) {
+    line = str_trim(line);
+    if (line.len < 5) return false;
+    for (size_t i = 0; i < line.len; ++i) {
+        if (line.ptr[i] != '-') return false;
+    }
+    return true;
+}
+
 static bool amber_parse_mdout(amber_energy_data_t* data, str_t filename, md_allocator_i* alloc) {
     md_file_t file = {0};
     if (!md_file_open(&file, filename, MD_FILE_READ)) {
@@ -437,10 +468,40 @@ static bool amber_parse_mdout(amber_energy_data_t* data, str_t filename, md_allo
     amber_energy_record_t record = {0};
     str_t line;
     bool ok = true;
+    bool skipping_summary = false;
+    bool after_summary = false;
     while (md_buffered_reader_extract_line(&line, &reader)) {
         if (ascii_contains_ignore_case(line.ptr, line.len, "A V E R A G E S", sizeof("A V E R A G E S") - 1) ||
             ascii_contains_ignore_case(line.ptr, line.len, "R M S  F L U C T U A T I O N S", sizeof("R M S  F L U C T U A T I O N S") - 1)) {
-            break;
+            if (!amber_record_finalize(data, &record, alloc)) { ok = false; break; }
+            skipping_summary = true;
+            after_summary = false;
+            continue;
+        }
+        if (amber_mdout_section_header(line, STR_LIT("4."), STR_LIT("RESULTS"))) {
+            if (!amber_record_finalize(data, &record, alloc)) { ok = false; break; }
+            if (data->num_rows) data->force_new_segment = true;
+            skipping_summary = false;
+            after_summary = false;
+            continue;
+        }
+        if (skipping_summary) {
+            if (amber_mdout_section_header(line, STR_LIT("5."), STR_LIT("TIMINGS"))) {
+                after_summary = true;
+                continue;
+            }
+            const str_t trimmed = str_trim_beg(line);
+            if (!after_summary || trimmed.len < 5 ||
+                !str_eq_ignore_case(str_substr(trimmed, 0, 5), STR_LIT("NSTEP")) ||
+                !ascii_contains_ignore_case(trimmed.ptr, trimmed.len, "TIME(PS)", 8)) {
+                continue;
+            }
+            data->force_new_segment = data->num_rows != 0;
+            skipping_summary = false;
+        }
+        if (record.active && record.has_total && amber_mdout_record_separator(line)) {
+            if (!amber_record_finalize(data, &record, alloc)) { ok = false; break; }
+            continue;
         }
         if (!amber_parse_line(data, &record, line, alloc)) {
             ok = false;
@@ -532,6 +593,7 @@ static bool amber_parse_mden(amber_energy_data_t* data, str_t filename, md_alloc
         if (!amber_parse_number(values[0], &value)) {
             // A header line. A new header (a second run appended to the file) closes the open record.
             if (!amber_record_finalize(data, &record, alloc)) { ok = false; break; }
+            if (k == 0 && data->num_rows) data->force_new_segment = true;
             for (size_t c = 0; c < num_values; ++c) {
                 header[k][c] = str_copy(values[c], alloc);
             }
@@ -601,7 +663,6 @@ bool md_amber_energy_system_supplement_from_file(md_system_t* sys, str_t filenam
     if (!amber_parse_file(&data, filename, alloc)) goto done;
 
     char group_buf[512];
-    char path_buf[512];
     const str_t group = amber_join(group_buf, sizeof(group_buf), run, STR_LIT("amber_energy"));
     if (str_empty(group)) {
         MD_LOG_ERROR("Amber energy: run path '" STR_FMT "' is too long", STR_ARG(run));

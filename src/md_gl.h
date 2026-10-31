@@ -263,6 +263,9 @@ void md_gl_mol_set_bond_orders(md_gl_mol_t mol, const struct md_system_t* sys, c
 // (md_gl_picking_offset_t gap_base). The system must be the one of the molecule. md_gl_mol_create sets them.
 void md_gl_mol_set_chain_gaps(md_gl_mol_t mol, const struct md_system_t* sys);
 
+// Replace the protein backbone after the system's topology changes.
+void md_gl_mol_set_system_backbone(md_gl_mol_t mol, const struct md_system_t* sys);
+
 void md_gl_mol_set_backbone_secondary_structure(md_gl_mol_t mol, uint32_t offset, uint32_t count, const md_gl_secondary_structure_t* secondary_structure, uint32_t byte_stride);
 
 // The backbone (ribbons, cartoon) orients its cross sections with temporal coherence: the spline is computed again in

@@ -7,6 +7,7 @@
 
 #include <core/md_allocator.h>
 #include <core/md_array.h>
+#include <core/md_hash.h>
 #include <core/md_log.h>
 #include <core/md_os.h>
 #include <core/md_parse.h>
@@ -332,15 +333,15 @@ static bool validate_topology(amber_block_t blocks[BLOCK_COUNT], amber_topology_
         return false;
     }
     size_t molecule_atoms = 0;
+    size_t residue_boundary = 1;
     const size_t nmol = md_array_size(blocks[ATOMS_PER_MOLECULE].values);
     if (blocks[ATOMS_PER_MOLECULE].present && blocks[ATOMS_PER_MOLECULE].format != 'i') goto invalid_molecule;
     for (size_t m = 0; m < nmol; ++m) {
         const int64_t count = integer_at(&blocks[ATOMS_PER_MOLECULE], m);
         if (count <= 0 || (uint64_t)count > na - molecule_atoms) goto invalid_molecule;
         molecule_atoms += (size_t)count;
-        bool boundary = false;
-        for (size_t r = 1; r <= nr; ++r) boundary |= offsets[r] == molecule_atoms;
-        if (!boundary) goto invalid_molecule;
+        while (residue_boundary <= nr && offsets[residue_boundary] < molecule_atoms) ++residue_boundary;
+        if (residue_boundary > nr || offsets[residue_boundary] != molecule_atoms) goto invalid_molecule;
     }
     if (blocks[ATOMS_PER_MOLECULE].present && molecule_atoms != na) goto invalid_molecule;
     if (blocks[SOLVENT_POINTERS].present) {
@@ -527,12 +528,18 @@ static bool amber_name_matches(str_t structure, str_t topology) {
            str_eq_ignore_case(structure, str_substr(topology, 0, structure.len));
 }
 
+static uint64_t amber_bond_key(md_atom_idx_t a, md_atom_idx_t b) {
+    const uint32_t first = (uint32_t)MIN(a, b);
+    const uint32_t second = (uint32_t)MAX(a, b);
+    return ((uint64_t)first << 32) | second;
+}
+
 bool md_amber_prmtop_system_supplement_from_file(md_system_t* sys, str_t filename) {
     ASSERT(sys);
     if (!sys->alloc || !sys->atom.count || !sys->atom.type_idx || !sys->atom.type.count ||
         !sys->atom.type.name || !sys->atom.type.ff_type || !sys->atom.type.z ||
-        !sys->atom.type.mass || !sys->atom.type.flags || !sys->residue.name ||
-        !sys->residue.atom_offset) {
+        !sys->atom.type.mass || !sys->atom.type.radius || !sys->atom.type.color ||
+        !sys->atom.type.flags || !sys->residue.name || !sys->residue.atom_offset) {
         MD_LOG_ERROR("Amber topology: load a structure with atoms and residues before applying this topology");
         return false;
     }
@@ -620,16 +627,37 @@ bool md_amber_prmtop_system_supplement_from_file(md_system_t* sys, str_t filenam
     const size_t old_bond_count = sys->bond.count;
     const size_t num_noncovalent = sys->bond.noncovalent_count;
     size_t num_user_bonds = 0;
+    md_hashset_t user_bonds = {.allocator = alloc};
     for (size_t i = 0; i < old_bond_count; ++i) {
-        num_user_bonds += md_bond_origin(sys->bond.flags[i]) == MD_BOND_ORIGIN_USER;
+        if (md_bond_origin(sys->bond.flags[i]) != MD_BOND_ORIGIN_USER) continue;
+        const md_atom_pair_t pair = sys->bond.pairs[i];
+        if (pair.idx[0] < 0 || pair.idx[1] < 0 ||
+            (size_t)pair.idx[0] >= topology.num_atoms || (size_t)pair.idx[1] >= topology.num_atoms) {
+            MD_LOG_ERROR("Amber topology: loaded structure has an invalid user bond");
+            goto done;
+        }
+        if (md_hashset_add(&user_bonds, amber_bond_key(pair.idx[0], pair.idx[1])) == UINT32_MAX) {
+            MD_LOG_ERROR("Amber topology: failed to index user bonds");
+            goto done;
+        }
+        ++num_user_bonds;
     }
-    const size_t new_bond_count = topology.num_bonds + num_user_bonds;
+    const size_t max_bond_count = topology.num_bonds + num_user_bonds;
     md_atom_pair_t* pairs = md_temp_alloc_array(temp, md_atom_pair_t,
-                                                 new_bond_count + num_noncovalent + 1);
+                                                 max_bond_count + num_noncovalent + 1);
     md_bond_flags_t* flags = md_temp_alloc_array(temp, md_bond_flags_t,
-                                                  new_bond_count + num_noncovalent + 1);
+                                                  max_bond_count + num_noncovalent + 1);
     if (!pairs || !flags) {
         MD_LOG_ERROR("Amber topology: failed to allocate topology bonds");
+        goto done;
+    }
+
+    // Keep distinct input types distinct even when their current appearances happen to match:
+    // workspace overrides must find the same atom groups when the PDB is loaded again.
+    const size_t original_type_count = sys->atom.type.count;
+    md_particle_type_idx_t* added_type_sources = md_temp_alloc_array(temp, md_particle_type_idx_t, topology.num_atoms);
+    if (!added_type_sources) {
+        MD_LOG_ERROR("Amber topology: failed to allocate particle type mapping");
         goto done;
     }
 
@@ -639,22 +667,33 @@ bool md_amber_prmtop_system_supplement_from_file(md_system_t* sys, str_t filenam
         const md_atomic_number_t z = elements[i];
         const str_t atom_name = blocks[ATOM_NAME].values[i];
         const str_t ff_type = blocks[AMBER_ATOM_TYPE].present ? blocks[AMBER_ATOM_TYPE].values[i] : (str_t){0};
+        const bool same_element = sys->atom.type.z[old_type] == z;
+        const float radius = same_element ? sys->atom.type.radius[old_type] : md_util_element_vdw_radius(z);
+        const uint32_t color = same_element ? sys->atom.type.color[old_type] : md_util_element_cpk_color(z);
         const md_particle_type_flags_t flags = md_particle_type_flags_set_particle_kind(
             sys->atom.type.flags[old_type],
             atom_mass == 0 && z == 0 ? MD_PARTICLE_VIRTUAL_SITE : MD_PARTICLE_ATOM);
         md_particle_type_idx_t type = 0;
         for (size_t t = 1; t < sys->atom.type.count; ++t) {
-            if (str_eq(atom_name, md_label_str(&sys->atom.type.name[t])) &&
+            const md_particle_type_idx_t source = t < original_type_count
+                ? (md_particle_type_idx_t)t : added_type_sources[t - original_type_count];
+            if (source == old_type &&
+                str_eq(atom_name, md_label_str(&sys->atom.type.name[t])) &&
                 str_eq(ff_type, md_label16_str(&sys->atom.type.ff_type[t])) &&
                 z == sys->atom.type.z[t] && atom_mass == sys->atom.type.mass[t] &&
+                radius == sys->atom.type.radius[t] && color == sys->atom.type.color[t] &&
                 flags == sys->atom.type.flags[t]) {
                 type = (md_particle_type_idx_t)t;
                 break;
             }
         }
         if (!type) {
-            type = md_particle_type_add(&sys->atom.type, atom_name, ff_type, z, atom_mass,
-                md_util_element_vdw_radius(z), md_util_element_cpk_color(z), flags, sys->alloc);
+            if (sys->atom.type.count > UINT16_MAX) {
+                MD_LOG_ERROR("Amber topology: too many particle types");
+                goto done;
+            }
+            type = md_particle_type_add(&sys->atom.type, atom_name, ff_type, z, atom_mass, radius, color, flags, sys->alloc);
+            added_type_sources[type - original_type_count] = old_type;
         }
         sys->atom.type_idx[i] = type;
     }
@@ -668,13 +707,16 @@ bool md_amber_prmtop_system_supplement_from_file(md_system_t* sys, str_t filenam
     for (size_t k = BONDS_H; k <= BONDS_NO_H; ++k) {
         const amber_block_t* block = &blocks[k];
         for (size_t b = 0; b < md_array_size(block->values); b += 3) {
-            pairs[bond_index] = (md_atom_pair_t){{
+            const md_atom_pair_t pair = {{
                 (md_atom_idx_t)(integer_at(block, b) / 3),
                 (md_atom_idx_t)(integer_at(block, b + 1) / 3),
             }};
+            if (md_hashset_get(&user_bonds, amber_bond_key(pair.idx[0], pair.idx[1]))) continue;
+            pairs[bond_index] = pair;
             flags[bond_index++] = md_bond_flags_set_origin(MD_BOND_FLAG_NONE, MD_BOND_ORIGIN_TOPOLOGY);
         }
     }
+    const size_t new_bond_count = bond_index;
     if (num_noncovalent) {
         memcpy(pairs + bond_index, sys->bond.pairs + old_bond_count, num_noncovalent * sizeof(*pairs));
         memcpy(flags + bond_index, sys->bond.flags + old_bond_count, num_noncovalent * sizeof(*flags));
@@ -711,7 +753,8 @@ bool md_amber_prmtop_system_supplement_from_file(md_system_t* sys, str_t filenam
 
     md_system_topology_changed(sys);
     md_util_system_infer(sys, &sys->reference,
-        MD_UTIL_INFER_PART_BIT | MD_UTIL_INFER_MOLECULE_BIT | MD_UTIL_INFER_BACKBONE_BIT);
+        MD_UTIL_INFER_PART_BIT | MD_UTIL_INFER_MOLECULE_BIT |
+        MD_UTIL_INFER_CHEMISTRY_BIT | MD_UTIL_INFER_BACKBONE_BIT);
     md_util_system_infer_lipids(sys);
     md_util_system_infer_residue_types(sys);
     result = true;

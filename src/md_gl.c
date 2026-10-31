@@ -2415,6 +2415,7 @@ static void mol_clear_backbone(molecule_t* mol) {
     mol->backbone_count = 0;
     mol->backbone_control_point_index_count = 0;
     mol->backbone_orient_history = false;
+    mol->marked.valid = false;
     mol->flags &= ~MOL_FLAG_HAS_BACKBONE;
     mol->tubes = false;
     mol->tube_max_extent = 0.0f;
@@ -2438,6 +2439,11 @@ static void mol_set_backbone(molecule_t* mol, uint32_t cp_count, uint32_t chain_
     // after (LINE_STRIP_ADJACENCY, legacy and debugging paths)
     uint32_t* cp_index = md_temp_alloc(temp, (cp_count + 3 * chain_count) * sizeof(uint32_t));
     gl_neighbor_idx_t* neighbor = md_temp_alloc(temp, cp_count * sizeof(gl_neighbor_idx_t));
+    if (!cp_index || !neighbor) {
+        MD_LOG_ERROR("Cannot set backbone: allocation failed");
+        md_temp_end(temp);
+        return;
+    }
     uint32_t index_count = 0;
     for (uint32_t c = 0; c < chain_count; ++c) {
         const uint32_t beg = chain_offset[c];
@@ -2470,9 +2476,6 @@ static void mol_set_backbone(molecule_t* mol, uint32_t cp_count, uint32_t chain_
     mol->backbone_control_point_index_count = index_count;
     mol->flags |= MOL_FLAG_HAS_BACKBONE;
     mol->spline_dirty = true;
-    // The control points of the marks are of the previous backbone
-    mol->marked.valid = false;
-
     backbone_bounds_t* bounds = &mol->backbone_bounds;
     md_allocator_i* alloc = md_get_heap_allocator();
     bounds->chain_count  = chain_count;
@@ -2492,6 +2495,53 @@ static void mol_set_backbone(molecule_t* mol, uint32_t cp_count, uint32_t chain_
         blocks_add(&mol->cp_blocks, c, bounds_atom[c]);
     }
 
+    md_temp_end(temp);
+}
+
+void md_gl_mol_set_system_backbone(md_gl_mol_t handle, const md_system_t* sys) {
+    molecule_t* gl_mol = mol_lookup(handle.id);
+    if (!gl_mol || !sys || gl_mol->atom_count != sys->atom.count) {
+        MD_LOG_ERROR("Cannot set backbone: invalid molecule or mismatched system");
+        return;
+    }
+    if (!sys->protein_backbone.range.count || !sys->protein_backbone.range.offset || !sys->protein_backbone.segment.atoms) {
+        mol_clear_backbone(gl_mol);
+        return;
+    }
+
+    md_temp_scope_t temp = md_temp_begin();
+    const uint32_t chain_count = (uint32_t)sys->protein_backbone.range.count;
+    const uint32_t backbone_count = sys->protein_backbone.range.offset[chain_count];
+    ASSERT(sys->protein_backbone.range.offset[0] == 0);
+    gl_backbone_data_t* backbone_data = md_temp_alloc(temp, backbone_count * sizeof(gl_backbone_data_t));
+    uint32_t* secondary_structure = md_temp_alloc(temp, backbone_count * sizeof(uint32_t));
+    uint32_t* ca_atom_idx = md_temp_alloc(temp, backbone_count * sizeof(uint32_t));
+    if (!backbone_data || !secondary_structure || !ca_atom_idx) {
+        MD_LOG_ERROR("Cannot set backbone: allocation failed");
+        mol_clear_backbone(gl_mol);
+        md_temp_end(temp);
+        return;
+    }
+    const uint32_t ss_coil = pack_gl_secondary_structure((md_gl_secondary_structure_t){0});
+
+    for (uint32_t i = 0; i < chain_count; ++i) {
+        const uint32_t beg = sys->protein_backbone.range.offset[i];
+        const uint32_t end = sys->protein_backbone.range.offset[i + 1];
+        for (uint32_t j = beg; j < end; ++j) {
+            backbone_data[j].bb_seg_idx = j;
+            const md_amino_acid_atoms_t atoms = sys->protein_backbone.segment.atoms[j];
+            backbone_data[j].ca = (uint32_t)atoms.ca;
+            backbone_data[j].c = (uint32_t)(atoms.c >= 0 ? atoms.c : atoms.ca);
+            backbone_data[j].o = (uint32_t)(atoms.o >= 0 ? atoms.o : atoms.ca);
+            backbone_data[j].flags = (j == beg ? BACKBONE_FLAG_CHAIN_BEG : 0) | (j == end - 1 ? BACKBONE_FLAG_CHAIN_END : 0);
+            secondary_structure[j] = ss_coil;
+            ca_atom_idx[j] = (uint32_t)atoms.ca;
+        }
+    }
+    mol_set_backbone(gl_mol, backbone_count, chain_count, sys->protein_backbone.range.offset, backbone_data, secondary_structure, ca_atom_idx);
+    if (md_system_state_has_coords(&sys->reference)) {
+        backbone_bounds_update(&gl_mol->backbone_bounds, 0, gl_mol->atom_count, sys->reference.xyz);
+    }
     md_temp_end(temp);
 }
 
@@ -2544,44 +2594,7 @@ md_gl_mol_t md_gl_mol_create(const md_system_t* sys) {
         //if (sys->comp.atom_offset)           gl_buffer_set_sub_data(gl_mol->buffer[GL_BUFFER_RESIDUE_ATOM_RANGE], 0, gl_mol->res_count * sizeof(uint32_t) * 2, sys->comp.atom_range);
         //if (desc->residue.backbone_atoms)       gl_buffer_set_sub_data(mol->buffer[GL_BUFFER_RESIDUE_BACKBONE_ATOMS], 0, sys->res_count * sizeof(uint8_t) * 4, desc->residue.backbone_atoms);
 
-        if (sys->protein_backbone.range.count > 0 && sys->protein_backbone.range.offset && sys->protein_backbone.segment.atoms) {
-            const uint32_t chain_count = (uint32_t)sys->protein_backbone.range.count;
-            const uint32_t backbone_count = sys->protein_backbone.range.offset[chain_count];
-            // Control point idx is what the backbone shaders pick by (backbone_base + idx), which is only the segment
-            // index while the ranges cover the segments in order from 0
-            ASSERT(sys->protein_backbone.range.offset[0] == 0);
-
-            gl_backbone_data_t* backbone_data = md_temp_alloc(temp_scope, backbone_count * sizeof(gl_backbone_data_t));
-            uint32_t* secondary_structure     = md_temp_alloc(temp_scope, backbone_count * sizeof(uint32_t));
-            uint32_t* ca_atom_idx             = md_temp_alloc(temp_scope, backbone_count * sizeof(uint32_t));
-
-            // The secondary structure depends on the frame, and is not the system's: coil until the caller sets it
-            // (md_gl_mol_set_backbone_secondary_structure)
-            const uint32_t ss_coil = pack_gl_secondary_structure((md_gl_secondary_structure_t){0});
-
-            for (uint32_t i = 0; i < chain_count; ++i) {
-                uint32_t beg = sys->protein_backbone.range.offset[i];
-                uint32_t end = sys->protein_backbone.range.offset[i+1];
-                for (uint32_t j = beg; j < end; ++j) {
-                    backbone_data[j].bb_seg_idx = j;
-                    // A trace (coarse grained) has its bead in ca and no C or O: the bead stands in for both. The
-                    // orientation comes from the frame of the trace itself; only where the trace runs straight does
-                    // it fall back on the carbonyl, which is then a fixed direction (compute_spline_extract.vert)
-                    const md_amino_acid_atoms_t atoms = sys->protein_backbone.segment.atoms[j];
-                    backbone_data[j].ca     = (uint32_t)atoms.ca;
-                    backbone_data[j].c      = (uint32_t)(atoms.c >= 0 ? atoms.c : atoms.ca);
-                    backbone_data[j].o      = (uint32_t)(atoms.o >= 0 ? atoms.o : atoms.ca);
-                    backbone_data[j].flags  = (j == beg ? BACKBONE_FLAG_CHAIN_BEG : 0) | (j == end - 1 ? BACKBONE_FLAG_CHAIN_END : 0);
-                    secondary_structure[j] = ss_coil;
-                    ca_atom_idx[j] = (uint32_t)atoms.ca;
-                }
-            }
-
-            mol_set_backbone(gl_mol, backbone_count, chain_count, sys->protein_backbone.range.offset, backbone_data, secondary_structure, ca_atom_idx);
-            if (md_system_state_has_coords(&sys->reference)) {
-                backbone_bounds_update(&gl_mol->backbone_bounds, 0, gl_mol->atom_count, sys->reference.xyz);
-            }
-        }
+        md_gl_mol_set_system_backbone(handle, sys);
 
         gl_mol->bond_count = (uint32_t)sys->bond.count;
         gl_mol->buffer[GL_BUFFER_BOND_ATOM_INDICES] = gl_buffer_create(gl_mol->bond_count * sizeof(uint32_t) * 2, NULL, GL_DYNAMIC_COPY);

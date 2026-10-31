@@ -104,6 +104,68 @@ static bool amber_test_file_create(const char* path, bool with_time, bool with_c
     return nc_close(ncid) == NC_NOERR && ok;
 }
 
+static bool amber_restart_file_create(const char* path) {
+    int ncid, atom_dim, spatial_dim, cell_spatial_dim, cell_angular_dim;
+    int spatial_var, coordinates_var, time_var, lengths_var, angles_var;
+    if (nc_create(path, NC_CLOBBER, &ncid) != NC_NOERR) return false;
+    if (nc_put_att_text(ncid, NC_GLOBAL, "Conventions", 12, "AMBERRESTART") != NC_NOERR ||
+        nc_put_att_text(ncid, NC_GLOBAL, "ConventionVersion", 3, "1.0") != NC_NOERR ||
+        nc_def_dim(ncid, "atom", 2, &atom_dim) != NC_NOERR ||
+        nc_def_dim(ncid, "spatial", 3, &spatial_dim) != NC_NOERR ||
+        nc_def_dim(ncid, "cell_spatial", 3, &cell_spatial_dim) != NC_NOERR ||
+        nc_def_dim(ncid, "cell_angular", 3, &cell_angular_dim) != NC_NOERR ||
+        nc_def_var(ncid, "spatial", NC_CHAR, 1, &spatial_dim, &spatial_var) != NC_NOERR) {
+        nc_close(ncid);
+        return false;
+    }
+    const int coordinate_dims[2] = { atom_dim, spatial_dim };
+    if (nc_def_var(ncid, "coordinates", NC_DOUBLE, 2, coordinate_dims, &coordinates_var) != NC_NOERR ||
+        nc_put_att_text(ncid, coordinates_var, "units", 8, "angstrom") != NC_NOERR ||
+        nc_def_var(ncid, "time", NC_DOUBLE, 0, NULL, &time_var) != NC_NOERR ||
+        nc_put_att_text(ncid, time_var, "units", 10, "picosecond") != NC_NOERR ||
+        nc_def_var(ncid, "cell_lengths", NC_DOUBLE, 1, &cell_spatial_dim, &lengths_var) != NC_NOERR ||
+        nc_put_att_text(ncid, lengths_var, "units", 8, "angstrom") != NC_NOERR ||
+        nc_def_var(ncid, "cell_angles", NC_DOUBLE, 1, &cell_angular_dim, &angles_var) != NC_NOERR ||
+        nc_put_att_text(ncid, angles_var, "units", 6, "degree") != NC_NOERR ||
+        nc_enddef(ncid) != NC_NOERR) {
+        nc_close(ncid);
+        return false;
+    }
+    const double coordinates[6] = {1, 2, 3, 4, 5, 6};
+    const double time = 2.5;
+    const double lengths[3] = {10, 20, 30};
+    const double angles[3] = {90, 90, 60};
+    const bool ok = nc_put_var_text(ncid, spatial_var, "xyz") == NC_NOERR &&
+        nc_put_var_double(ncid, coordinates_var, coordinates) == NC_NOERR &&
+        nc_put_var_double(ncid, time_var, &time) == NC_NOERR &&
+        nc_put_var_double(ncid, lengths_var, lengths) == NC_NOERR &&
+        nc_put_var_double(ncid, angles_var, angles) == NC_NOERR;
+    return nc_close(ncid) == NC_NOERR && ok;
+}
+
+UTEST(amber_netcdf, initial_state_reads_restart_and_checks_atom_count) {
+    remove(AMBER_TEST_FILE);
+    ASSERT_TRUE(amber_restart_file_create(AMBER_TEST_FILE));
+    const str_t path = STR_LIT(AMBER_TEST_FILE);
+    EXPECT_FALSE(md_amber_netcdf_file_is_trajectory(path));
+
+    md_allocator_i* alloc = md_vm_arena_create(MEGABYTES(16));
+    md_system_state_t state = {.alloc = alloc};
+    EXPECT_FALSE(md_amber_netcdf_state_init_from_file(&state, path, 3));
+    EXPECT_TRUE(state.xyz == NULL);
+    ASSERT_TRUE(md_amber_netcdf_state_init_from_file(&state, path, 2));
+    EXPECT_NEAR(1.0, state.xyz[0].x, 1.0e-6);
+    EXPECT_NEAR(6.0, state.xyz[1].z, 1.0e-6);
+    EXPECT_TRUE(md_unitcell_is_triclinic(&state.unitcell));
+    EXPECT_NEAR(10.0, state.unitcell.x, 1.0e-6);
+    EXPECT_NEAR(10.0, state.unitcell.xy, 1.0e-6);
+    EXPECT_NEAR(17.3205, state.unitcell.y, 1.0e-4);
+    EXPECT_NEAR(30.0, state.unitcell.z, 1.0e-6);
+    md_system_state_free(&state);
+    md_vm_arena_destroy(alloc);
+    remove(AMBER_TEST_FILE);
+}
+
 UTEST(amber_netcdf, publishes_streamed_coordinates_time_and_triclinic_cells) {
     remove(AMBER_TEST_FILE);
     ASSERT_TRUE(amber_test_file_create(AMBER_TEST_FILE, true, true, "AMBER", false, false, "xyz", false, false));
