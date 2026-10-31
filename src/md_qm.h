@@ -230,6 +230,77 @@ bool md_qm_publish_orbital_densities(struct md_system_t* sys);
 size_t md_qm_density_orbitals(double** out_rows, double** out_weights, size_t* out_num_ao, const struct md_system_t* sys,
                               str_t density_path, struct md_allocator_i* alloc);
 
+// The orbitals of the AVERAGE LOCAL IONIZATION ENERGY (Sjoberg, Murray, Brinck and Politzer, Can. J. Chem. 68,
+// 1440 (1990)),
+//
+//     I(r) = sum_k n_k |e_k| |phi_k(r)|^2 / sum_k n_k |phi_k(r)|^2
+//
+// over the occupied orbitals of both spins, n_k the occupation and e_k the orbital energy: where the least
+// tightly held electrons are, the lowest values (on an isodensity surface, the sites an electrophile or a
+// radical attacks). Both sums are of squares of the same orbitals, so this hands out the rows once and two
+// sets of weights: weights, n_k (exactly md_qm_density_orbitals' for orbital/total/density: the denominator
+// is the electron density), and energy_weights, n_k |e_k| in hartree (the numerator). What
+// md_gto_iso_field_create_products takes, once with each.
+//
+// An orbital both spins share appears once with its weights summed: n_a + n_b, and n_a |e_a| + n_b |e_b| -
+// a restricted open shell's two spins may state different energies for the same orbital. Reads
+// orbital/{alpha,beta}/{coefficient,occupation,energy}.
+//
+// Canonical orbitals only: every occupation 0, 1 or 2 (within 1e-3). Natural orbitals (fractional
+// occupations) have no orbital energies to weight by, and a file that gives them a column of energies
+// anyway would give a plausible looking I(r) that means nothing; 0 is returned for them, and for a file
+// without orbital energies (TREXIO may leave them out) or with an energy that is not finite. The energies
+// of Kohn-Sham orbitals are not ionization energies, and I(r) from them lies below the Hartree-Fock one,
+// as is usual.
+//
+// Where it means something: I(r) >= |e_HOMO| everywhere, and on an isodensity surface of 0.001-0.002 au it
+// is the usual 0.3-0.6 hartree. Far out it is not |e_HOMO|, as with exact orbitals: a gaussian basis' tails
+// are its most diffuse primitives', and the ratio there is of two vanishing sums (water 8.7 bohr out, rho
+// 7e-12: 0.49 against |e_HOMO| 0.29). A consumer evaluates it where rho is substantial.
+//
+// Every array from 'alloc' (sizeof(double) * count * num_ao, and sizeof(double) * count each). Returns
+// count; 0 on failure.
+size_t md_qm_alie_orbitals(double** out_rows, double** out_weights, double** out_energy_weights, size_t* out_num_ao,
+                           const struct md_system_t* sys, struct md_allocator_i* alloc);
+
+// Whether md_qm_alie_orbitals can make them: the alpha orbitals' coefficients, occupations and energies are
+// there and the occupations are those of canonical orbitals. Reads the occupations only.
+bool md_qm_alie_available(const struct md_system_t* sys);
+
+// The orbitals of the LOCAL ELECTRON ATTACHMENT ENERGY (Brinck, Carlqvist and Stenlid, J. Phys. Chem. A 120,
+// 10023 (2016)),
+//
+//     E(r) = sum_{i >= LUMO, e_i < 0} e_i rho_i(r) / rho(r)
+//
+// the counterpart of the average local ionization energy for nucleophiles: the bound virtual orbitals (only
+// they bind an added electron, by Janak's theorem) weighted by their energies, against the ground state
+// density. Never positive; the lowest values mark where a nucleophile attacks or a halogen bond forms (a
+// halogen's sigma hole). The numerator is handed out here, as rows and weights for
+// md_gto_iso_field_create_products; the denominator is the total density (md_qm_density_orbitals,
+// orbital/total/density).
+//
+// rho_i is the density the virtual would hold filled: per SPIN orbital, the weight is (1 - n) e for one with
+// e < 0, summed over both spins. A closed shell's virtual so counts twice, 2 e |phi|^2 - the paper's eq. 10,
+// E ~ 2 rho_LUMO e_LUMO / rho, and its Table S1, whose numbers come out only with the 2 - and a restricted and an
+// unrestricted calculation of one closed shell give the same E(r). Unrestricted: each spin's virtuals once.
+// Restricted open shell: a singly occupied orbital contributes its empty spin, when that spin's energy is below
+// zero. An orbital both spins share is there once with the two shares summed.
+//
+// Canonical orbitals only: per spin occupations of 0 or 1 (within 1e-3), as the readers publish them. Nothing
+// (0) when no virtual is bound: then E(r) is 0 everywhere, which is what Hartree-Fock virtuals, nearly always
+// positive, give. The paper's level: B3LYP/6-31+G(d,p) (hybrid GKS-DFT), on the 0.004 au isodensity surface.
+// Strongly method and basis dependent, and the virtuals are more diffuse than the occupied orbitals: far out
+// the ratio grows without bound. A consumer evaluates it on an isodensity surface.
+//
+// Arrays from 'alloc' (sizeof(double) * count * num_ao and sizeof(double) * count). Returns count; 0 on failure
+// or when no virtual is bound.
+size_t md_qm_attachment_orbitals(double** out_rows, double** out_weights, size_t* out_num_ao, const struct md_system_t* sys,
+                                 struct md_allocator_i* alloc);
+
+// Whether md_qm_attachment_orbitals has orbitals to give: canonical orbitals with energies, at least one virtual
+// bound. Reads the occupations and energies.
+bool md_qm_attachment_available(const struct md_system_t* sys);
+
 // orbital/{total,difference}/density (alpha + beta, alpha - beta) as virtual attributes over whatever
 // orbital/{alpha,beta}/density are: for a producer that publishes those two itself (read from a file
 // that stores them, say). Where beta is an alias of alpha, alpha is read once for the total and not
