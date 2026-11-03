@@ -3029,6 +3029,7 @@ static int compare_bond_excess(const void* a, const void* b) {
 // Factors on the sum of the covalent radii (Cordero et al. 2008, which covers metal-ligand distances too)
 static const float bond_k_min    = 0.65f;   // Shorter than this is a clash, not a bond
 static const float bond_k_cov    = 1.15f;   // Covalent bond between non-metals
+static const float bond_k_fluorine = 1.30f; // F to F, O or N
 static const float bond_k_coord  = 1.30f;   // Upper end of the candidate search
 static const float bond_k_ligand = 1.25f;   // Metal to a donor (N, O, S, P, halogen): 1.0-1.1 in well resolved structures
 static const float bond_k_carbon = 1.15f;   // Transition metal to carbon (carbenes, carbonyls, cyclopentadienyl)
@@ -3047,7 +3048,11 @@ static bond_rule_t bond_rule(int ei, int ej, bool same_res, bool water) {
     const bool mi = is_metal(ei);
     const bool mj = is_metal(ej);
     if (!mi && !mj) {
-        const bond_rule_t r = { same_res ? bond_k_cov * 1.05f : bond_k_cov, false };
+        // Fluorine's radius (0.57) is from its bonds to carbon: between two electronegative atoms its bonds are
+        // longer (F2 1.41, OF2 1.41, NF3 1.37 Å, against 1.31, 1.41 and 1.47 within bond_k_cov)
+        const bool fluorine_pair = (ei == F && (ej == F || ej == O || ej == N)) || (ej == F && (ei == O || ei == N));
+        const float k = fluorine_pair ? bond_k_fluorine : bond_k_cov;
+        const bond_rule_t r = { same_res ? k * 1.05f : k, false };
         return r;
     }
     if (mi != mj) {
