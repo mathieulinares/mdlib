@@ -30,6 +30,7 @@ struct md_allocator_i;
 // (MD_BOND_KIND_ELASTIC) are no bonds here at all. Running it again gives the same result.
 //
 // HYDROGENS. Each residue (or molecule, without residues) is handled by what it carries:
+//   - QM atoms (MD_ATOM_FLAG_QM): all nuclei are explicit, even in a hydrogen-free fragment such as cyanide.
 //   - all hydrogens (some on carbon): every hydrogen is explicit, and orders and charges follow from the valences.
 //     This is exact up to resonance.
 //   - polar hydrogens only (united atom force fields): the hydrogens of carbons are implicit, from the geometry

@@ -261,6 +261,28 @@ UTEST(chem, ions) {
     md_vm_arena_destroy(alloc);
 }
 
+UTEST(chem, qm_cyanide_has_no_implicit_hydrogen) {
+    md_allocator_i* alloc = md_vm_arena_create(GIGABYTES(1));
+    md_system_t sys = { .alloc = alloc };
+    md_system_state_t st = { .alloc = alloc };
+    const char* xyz = "5\nCN- and HCN\nC 0 0 0\nN 1.17 0 0\nH 9 0 0\nC 10.06 0 0\nN 11.23 0 0\n";
+    ASSERT_TRUE(md_xyz_system_init_from_str(&sys, &st, str_from_cstr(xyz), MD_XYZ_OPTION_NONE));
+    for (size_t i = 0; i < sys.atom.count; ++i) sys.atom.flags[i] |= MD_ATOM_FLAG_QM;
+    ASSERT_TRUE(md_util_system_infer(&sys, &st, MD_UTIL_INFER_ALL));
+    for (int pass = 0; pass < 2; ++pass) {
+        EXPECT_EQ(-1, md_atom_formal_charge(&sys.atom, 0));
+        EXPECT_EQ(0, md_atom_formal_charge(&sys.atom, 1));
+        EXPECT_EQ(0, md_atom_hydrogen_count(&sys.atom, 0));
+        EXPECT_EQ(0, md_atom_hydrogen_count(&sys.atom, 1));
+        EXPECT_EQ(3, md_bond_order(sys.bond.flags[find_bond(&sys, 0, 1)]));
+        EXPECT_EQ(0, md_atom_formal_charge(&sys.atom, 3));
+        EXPECT_EQ(0, md_atom_formal_charge(&sys.atom, 4));
+        EXPECT_EQ(1, md_atom_hydrogen_count(&sys.atom, 3));
+        ASSERT_TRUE(md_chem_perceive(&sys, &st, MD_CHEM_FLAG_NONE));
+    }
+    md_vm_arena_destroy(alloc);
+}
+
 // Orders a file gives are kept, and perception run again gives what it gave
 UTEST_F(chem, given_orders_and_rerun) {
     const ref_comp_t* c = find_component(utest_fixture->comps, "PHE");

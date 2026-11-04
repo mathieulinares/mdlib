@@ -326,7 +326,9 @@ static void assign_modes(chem_t* c, const md_system_t* sys) {
     }
     for (size_t i = 0; i < N; ++i) {
         const uint8_t h = has[group[i]];
-        c->mode[i] = (h & 2) ? HMODE_ALL : (h & 1) ? HMODE_POLAR : HMODE_NONE;
+        // QM nuclei are complete, including fragments with no hydrogen (CN- is not implicit HCN).
+        c->mode[i] = (md_atom_flags(&sys->atom, i) & MD_ATOM_FLAG_QM) ? HMODE_ALL :
+                     (h & 2) ? HMODE_ALL : (h & 1) ? HMODE_POLAR : HMODE_NONE;
     }
 }
 
@@ -1389,7 +1391,11 @@ static uint8_t* perceive(chem_t* c, const float* q_given) {
                     c->charge[i] += 1;       // Phosphonium, sulfonium
                 } else if (z == MD_Z_C || z == MD_Z_Si) {
                     if (none) c->h_imp[i] += 1;
-                    else break;             // A carbocation or radical: left as it is
+                    else if (z == MD_Z_C && sigma(c, (uint32_t)i) == 1 && pi_sum(c, (uint32_t)i) == 2 &&
+                             c->z[c->nbr[c->off[i]]] == MD_Z_N && !c->charge_fixed[i]) {
+                        // The terminal carbon of cyanide or an isonitrile has a lone pair, not a radical.
+                        c->charge[i] -= 1;
+                    } else break;           // A carbocation or radical: left as it is
                 } else {
                     break;
                 }
@@ -1650,9 +1656,9 @@ static uint8_t delta_mode(const md_system_t* sys, uint8_t* state, uint8_t* mode,
     const uint8_t m = (has & 2) ? HMODE_ALL : (has & 1) ? HMODE_POLAR : HMODE_NONE;
     for (size_t k = 0; k < md_array_size(group); ++k) {
         state[group[k]] |= DELTA_MODE;
-        mode[group[k]] = m;
+        mode[group[k]] = (md_atom_flags(&sys->atom, group[k]) & MD_ATOM_FLAG_QM) ? HMODE_ALL : m;
     }
-    return m;
+    return mode[a];
 }
 
 static inline int compare_u32(const void* a, const void* b) {
