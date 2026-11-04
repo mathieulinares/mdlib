@@ -198,6 +198,7 @@ typedef struct md_attributes_t {
     struct md_allocator_i*   alloc;
     md_array(md_attribute_t) attr;          // sorted by path
     md_array(uint32_t)       id_index;      // open addressing over attr, holds index+1; 0 is empty
+    size_t                   num_aliases;   // of attr, so that what looks for aliases can skip the look when there are none
 
     // String pool behind MD_ATTRIBUTE_TYPE_STR: append only, interning, entry 0 is "".
     md_array(char)           str_data;
@@ -408,6 +409,19 @@ bool md_attribute_axis_map(size_t* out_index, const md_attribute_t* src_axis, si
 // For a provider: read bytes at offset from the file at path, through io's cache of open files when
 // io is non NULL. Returns the number of bytes read.
 size_t md_attribute_io_read_at(md_attribute_io_t* io, str_t path, int64_t offset, void* dst, size_t bytes);
+
+// For a provider: a buffer of bytes kept by io across calls under key (nonzero), for what a provider decodes once and
+// reads from for several frames - a compressed block of a file holding more than one. *hit is true when the buffer still
+// holds the bytes last stored under the key, with the same byte count; false when the provider must fill it. The buffer
+// is valid until the next call on io. NULL when io is NULL or the bytes cannot be had: the provider decodes into
+// scratch of its own then.
+void* md_attribute_io_block(md_attribute_io_t* io, uint64_t key, size_t bytes, bool* hit);
+
+// For a provider that was handed a block to fill and failed to: the block holds nothing under the key any more
+void md_attribute_io_block_forget(md_attribute_io_t* io, uint64_t key);
+
+// What a block key is made from: the file and where the block is in it
+uint64_t md_attribute_io_block_key(str_t path, int64_t offset);
 
 #ifdef __cplusplus
 }

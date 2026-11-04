@@ -4375,6 +4375,83 @@ UTEST(util, min_max_distance_groups) {
     EXPECT_EQ(0, i1);
 }
 
+// The pairs near the extreme: every pair within tol of it and no other, against the minimum image by exhaustion, in
+// every kind of cell. Points on a coarse grid make many pairs tie. Too small a cap says so.
+UTEST(util, min_max_distance_near) {
+    const double s2 = sqrt(2.0), d = 30.0;
+    const md_unitcell_t cells[] = {
+        md_unitcell_none(),
+        md_unitcell_from_extent(30, 30, 30),
+        md_unitcell_from_extent(9, 12, 10),
+        md_unitcell_from_basis_parameters(30, 40, 0, 0, 0, 0),
+        md_unitcell_from_extent_and_angles(30, 30, 30, 70, 70, 70),
+        md_unitcell_from_basis_parameters(d, d, d / s2, 0, d / 2, d / 2),
+        md_unitcell_from_basis_parameters(30, 20, 25, 27, 20, 15),
+    };
+    dist_rng_state = 0x13198A2E03707344ULL;
+    enum { NA = 70, NB = 90, CAP = NA * NB };
+    vec3_t a[NA], b[NB];
+    int64_t* na_idx = malloc(CAP * sizeof(int64_t));
+    int64_t* nb_idx = malloc(CAP * sizeof(int64_t));
+    uint8_t* in_set = malloc(CAP);
+    for (size_t ci = 0; ci < ARRAY_SIZE(cells); ++ci) {
+        const md_unitcell_t* cell = &cells[ci];
+        for (int trial = 0; trial < 12; ++trial) {
+            const size_t na = 1 + (size_t)(dist_rand() * (NA - 1)), nb = 1 + (size_t)(dist_rand() * (NB - 1));
+            const float grid = trial % 3 == 0 ? 0.0f : trial % 3 == 1 ? 0.5f : 2.0f;
+            for (size_t i = 0; i < na; ++i) a[i] = dist_rand_point(cell, 40, -1.5, 2.5);
+            for (size_t j = 0; j < nb; ++j) b[j] = trial % 4 == 3 && j < na ? a[j] : dist_rand_point(cell, 40, -1.5, 2.5);
+            if (grid > 0) {
+                for (size_t i = 0; i < na; ++i) for (int k = 0; k < 3; ++k) a[i].elem[k] = roundf(a[i].elem[k] / grid) * grid;
+                for (size_t j = 0; j < nb; ++j) for (int k = 0; k < 3; ++k) b[j].elem[k] = roundf(b[j].elem[k] / grid) * grid;
+            }
+            const float tol = trial % 2 ? 0.0f : 0.3f;
+            for (int largest = 0; largest < 2; ++largest) {
+                double ref = largest ? -1.0 : DBL_MAX;
+                for (size_t i = 0; i < na; ++i) {
+                    for (size_t j = 0; j < nb; ++j) {
+                        const double r = dist_ref(a[i], b[j], cell);
+                        ref = largest ? MAX(ref, r) : MIN(ref, r);
+                    }
+                }
+                const size_t cnt = largest ? md_util_max_distance_near(na_idx, nb_idx, CAP, tol, a, na, b, nb, cell)
+                                           : md_util_min_distance_near(na_idx, nb_idx, CAP, tol, a, na, b, nb, cell);
+                ASSERT_LE(cnt, (size_t)CAP);
+                ASSERT_GE(cnt, (size_t)1);
+                memset(in_set, 0, CAP);
+                for (size_t c = 0; c < cnt; ++c) {
+                    ASSERT_GE(na_idx[c], 0);
+                    ASSERT_LT(na_idx[c], (int64_t)na);
+                    ASSERT_GE(nb_idx[c], 0);
+                    ASSERT_LT(nb_idx[c], (int64_t)nb);
+                    const size_t e = (size_t)na_idx[c] * nb + (size_t)nb_idx[c];
+                    EXPECT_EQ(0, in_set[e]);      // each pair once
+                    in_set[e] = 1;
+                }
+                // Every pair clearly within tol is there, every pair there is within it, to the kernel's rounding
+                for (size_t i = 0; i < na; ++i) {
+                    for (size_t j = 0; j < nb; ++j) {
+                        const double off = largest ? ref - dist_ref(a[i], b[j], cell) : dist_ref(a[i], b[j], cell) - ref;
+                        if (off <= tol - 1.0e-3) EXPECT_EQ(1, in_set[i * nb + j]);
+                        if (in_set[i * nb + j]) EXPECT_LE(off, tol + 1.0e-3);
+                    }
+                }
+                // Too small a cap: more than it
+                if (cnt > 1) {
+                    const size_t c2 = largest ? md_util_max_distance_near(na_idx, nb_idx, cnt - 1, tol, a, na, b, nb, cell)
+                                              : md_util_min_distance_near(na_idx, nb_idx, cnt - 1, tol, a, na, b, nb, cell);
+                    EXPECT_GT(c2, cnt - 1);
+                }
+            }
+        }
+    }
+    int64_t i0 = 0, i1 = 0;
+    EXPECT_EQ((size_t)0, md_util_min_distance_near(&i0, &i1, 1, 0.0f, a, 0, b, 1, NULL));
+    free(na_idx);
+    free(nb_idx);
+    free(in_set);
+}
+
 UTEST(util, ramachandran_classify) {
     // Two chains, both starting with a proline, the second right after a residue which is not one:
     //   chain 0: PRO GLY PRO ALA PRO PRO SER
@@ -4700,4 +4777,26 @@ UTEST(util, packed_kernels_independent_of_address) {
         EXPECT_EQ(0, memcmp(ref_lin, lin, sizeof(lin)));
     }
     md_free(md_get_heap_allocator(), raw, (6 * N + 64) * sizeof(float) + 64);
+}
+
+// Lengths and angles in, lengths and angles out: a triclinic cell whose alpha is not 90 among them
+UTEST(util, unitcell_extent_angles_round_trip) {
+    const double cells[][6] = {
+        { 35.446, 35.062, 34.159, 91.328, 61.735, 44.407 },
+        { 40.0, 40.0, 40.0, 109.4712206, 109.4712206, 109.4712206 },   // truncated octahedron
+        { 30.0, 31.0, 32.0, 60.0, 70.0, 80.0 },
+        { 30.0, 31.0, 32.0, 90.0, 90.0, 90.0 },
+    };
+    for (size_t i = 0; i < ARRAY_SIZE(cells); ++i) {
+        const double* p = cells[i];
+        const md_unitcell_t uc = md_unitcell_from_extent_and_angles(p[0], p[1], p[2], p[3], p[4], p[5]);
+        double v[6];
+        md_unitcell_extract_extent_angles(&v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &uc);
+        for (int k = 0; k < 6; ++k) EXPECT_NEAR(p[k], v[k], 1e-6);
+    }
+    // No cell: no angles, and no NaN
+    const md_unitcell_t none = md_unitcell_none();
+    double v[6];
+    md_unitcell_extract_extent_angles(&v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &none);
+    EXPECT_EQ(0.0, v[3]);
 }
